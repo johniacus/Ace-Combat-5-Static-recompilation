@@ -1,3 +1,23 @@
+# PS Vita port (this branch)
+
+This fork adds a **PlayStation Vita port** of the Ace Combat 5 static
+recompilation, on the `vita-port` branch. In-mission it runs at about 50–60 fps
+in normal flight and 25–35 fps in the heaviest terrain scenes. Audio, menus and
+widescreen work.
+
+- **Building, settings, results and known issues:** [platform/vita/NOTES.md](platform/vita/NOTES.md)
+- **Code:** `platform/vita/` (Vita platform layer and vitaGL renderer) and the
+  changes under `runtime/`.
+- **No game data is included.** You need your own disc. Generate the
+  recompiled code from it as described below, and put the disc image at
+  `ux0:data/ac5/ac5.iso` on the Vita.
+- **LiveArea art is not included.** Supply your own in `platform/vita/assets/`.
+
+Based on [sal063/ace-combat-5-static-recompilation](https://github.com/sal063/ace-combat-5-static-recompilation)
+(Apache 2.0). The original README follows.
+
+---
+
 # ps2recomp: Ace Combat 5
 
 A static recompilation of **Ace Combat 5: The Unsung War** (PS2, NTSC-U) for Windows.
