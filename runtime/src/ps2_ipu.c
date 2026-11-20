@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define IPU_BCLR   0u
 #define IPU_IDEC   1u
@@ -49,7 +50,12 @@ typedef struct {
     u8  iq_intra[64], iq_noni[64];
     u16 vq[16];
     u64 stat_cmd[16], stat_mb, stat_err;
+    u32 code;        /* command the snapshot was taken for */
 } ipu_snap;
+/* Only SETIQ/SETVQ change the tables, and a command only bumps its own
+ * stat_cmd slot: the snapshot copies just what the command can change
+ * (it is taken ~50,000 times a second during a movie). */
+static u32 snap_code;
 
 static ipu_snap cmd_snap;
 static u32 ipu_pending_cmd;
@@ -69,10 +75,13 @@ static void snap_save(ipu_snap *k) {
     k->ipu_th0 = ipu_th0; k->ipu_th1 = ipu_th1;
     k->ipu_scd = ipu_scd; k->ipu_ecd = ipu_ecd;
     memcpy(k->dc_pred, dc_pred, sizeof dc_pred);
-    memcpy(k->iq_intra, iq_intra_raster, sizeof iq_intra_raster);
-    memcpy(k->iq_noni, iq_noni_raster, sizeof iq_noni_raster);
-    memcpy(k->vq, vq_clut, sizeof vq_clut);
-    memcpy(k->stat_cmd, stat_cmd, sizeof stat_cmd);
+    k->code = snap_code & 15u;
+    if (k->code == IPU_SETIQ || k->code == IPU_SETVQ) {
+        memcpy(k->iq_intra, iq_intra_raster, sizeof iq_intra_raster);
+        memcpy(k->iq_noni, iq_noni_raster, sizeof iq_noni_raster);
+        memcpy(k->vq, vq_clut, sizeof vq_clut);
+    }
+    k->stat_cmd[k->code] = stat_cmd[k->code];
     k->stat_mb = stat_mb; k->stat_err = stat_err;
 }
 
@@ -83,10 +92,12 @@ static void snap_restore(const ipu_snap *k) {
     ipu_th0 = k->ipu_th0; ipu_th1 = k->ipu_th1;
     ipu_scd = k->ipu_scd; ipu_ecd = k->ipu_ecd;
     memcpy(dc_pred, k->dc_pred, sizeof dc_pred);
-    memcpy(iq_intra_raster, k->iq_intra, sizeof iq_intra_raster);
-    memcpy(iq_noni_raster, k->iq_noni, sizeof iq_noni_raster);
-    memcpy(vq_clut, k->vq, sizeof vq_clut);
-    memcpy(stat_cmd, k->stat_cmd, sizeof stat_cmd);
+    if (k->code == IPU_SETIQ || k->code == IPU_SETVQ) {
+        memcpy(iq_intra_raster, k->iq_intra, sizeof iq_intra_raster);
+        memcpy(iq_noni_raster, k->iq_noni, sizeof iq_noni_raster);
+        memcpy(vq_clut, k->vq, sizeof vq_clut);
+    }
+    stat_cmd[k->code] = k->stat_cmd[k->code];
     stat_mb = k->stat_mb; stat_err = k->stat_err;
 }
 
@@ -127,9 +138,15 @@ static u32 bit_peek(u32 n) {
     u64 v;
     int i;
     if (!n) return 0;
-    v = 0;
-    for (i = 0; i < 5; i++)
-        v = (v << 8) | (u64)(byte + (u32)i < in_len ? in_buf[byte + (u32)i] : 0u);
+    if (byte + 5u <= in_len) {
+        const u8 *p = in_buf + byte;
+        v = ((u64)p[0] << 32) | ((u64)p[1] << 24) | ((u64)p[2] << 16)
+          | ((u64)p[3] << 8) | (u64)p[4];
+    } else {
+        v = 0;
+        for (i = 0; i < 5; i++)
+            v = (v << 8) | (u64)(byte + (u32)i < in_len ? in_buf[byte + (u32)i] : 0u);
+    }
     if (ipu_cmd_active && bit_avail() < n) ipu_starved = 1;
     return (u32)((v >> (40u - sh - n)) & ((1ull << n) - 1ull));
 }
@@ -168,6 +185,25 @@ static void out_push(const void *p, u32 n) {
     }
     memcpy(out_buf + out_len, p, n);
     out_len += n;
+}
+
+/* Room for n more output bytes, filled by the caller. */
+static u8 *out_grow(u32 n) {
+    u8 *p;
+    if (n > UINT32_MAX - out_len) ps2_fatal("IPU output size overflow");
+    if (out_len + n > out_cap) {
+        if (!out_cap) out_cap = 1u << 20;
+        while (out_cap < out_len + n) {
+            if (out_cap > UINT32_MAX / 2u) { out_cap = out_len + n; break; }
+            out_cap *= 2u;
+        }
+        u8 *grown = (u8 *)realloc(out_buf, out_cap);
+        if (!grown) ps2_fatal("IPU output allocation failed");
+        out_buf = grown;
+    }
+    p = out_buf + out_len;
+    out_len += n;
+    return p;
 }
 
 typedef struct { const char *bits; s16 a; } vlc_str;
@@ -347,26 +383,146 @@ static void idct_init(void) {
                          * cos((2.0 * x + 1.0) * u * 3.14159265358979323846 / 16.0);
 }
 
-static void idct_8x8(const s16 *in, s16 *out, int lo, int hi) {
-    double tmp[64];
-    int y, x, u, v;
-    for (y = 0; y < 8; y++)
-        for (x = 0; x < 8; x++) {
-            double s = 0.0;
-            for (u = 0; u < 8; u++) if (in[y * 8 + u]) s += idct_c[u][x] * in[y * 8 + u];
-            tmp[y * 8 + x] = s * 0.5;
+/* Chen-Wang integer IDCT (the ISO/IEC 13818-4 reference decoder's), IEEE
+ * 1180 accurate. Row pass then column pass, both skipping all-zero AC. */
+#define IW1 2841
+#define IW2 2676
+#define IW3 2408
+#define IW5 1609
+#define IW6 1108
+#define IW7 565
+static void idct_8x8_i32(const s16 *in, s16 *out, int lo, int hi) {
+    int b[64];
+    int i;
+    for (i = 0; i < 8; i++) {
+        const s16 *r = in + i * 8;
+        int *o = b + i * 8;
+        int x0, x1, x2, x3, x4, x5, x6, x7, x8;
+        x1 = r[4] << 11; x2 = r[6]; x3 = r[2]; x4 = r[1];
+        x5 = r[7]; x6 = r[5]; x7 = r[3];
+        if (!(x1 | x2 | x3 | x4 | x5 | x6 | x7)) {
+            int dc = r[0] * 8;
+            o[0] = o[1] = o[2] = o[3] = o[4] = o[5] = o[6] = o[7] = dc;
+            continue;
         }
-    for (x = 0; x < 8; x++)
-        for (y = 0; y < 8; y++) {
-            double s = 0.0;
-            int r;
-            for (v = 0; v < 8; v++) s += idct_c[v][y] * tmp[v * 8 + x];
-            s *= 0.5;
-            r = (int)(s < 0 ? s - 0.5 : s + 0.5);
+        x0 = (r[0] << 11) + 128;
+        x8 = IW7 * (x4 + x5); x4 = x8 + (IW1 - IW7) * x4; x5 = x8 - (IW1 + IW7) * x5;
+        x8 = IW3 * (x6 + x7); x6 = x8 - (IW3 - IW5) * x6; x7 = x8 - (IW3 + IW5) * x7;
+        x8 = x0 + x1; x0 -= x1;
+        x1 = IW6 * (x3 + x2); x2 = x1 - (IW2 + IW6) * x2; x3 = x1 + (IW2 - IW6) * x3;
+        x1 = x4 + x6; x4 -= x6; x6 = x5 + x7; x5 -= x7;
+        x7 = x8 + x3; x8 -= x3; x3 = x0 + x2; x0 -= x2;
+        x2 = (181 * (x4 + x5) + 128) >> 8; x4 = (181 * (x4 - x5) + 128) >> 8;
+        o[0] = (x7 + x1) >> 8; o[1] = (x3 + x2) >> 8; o[2] = (x0 + x4) >> 8; o[3] = (x8 + x6) >> 8;
+        o[4] = (x8 - x6) >> 8; o[5] = (x0 - x4) >> 8; o[6] = (x3 - x2) >> 8; o[7] = (x7 - x1) >> 8;
+    }
+    for (i = 0; i < 8; i++) {
+        int *c = b + i;
+        int x0, x1, x2, x3, x4, x5, x6, x7, x8, k, v[8];
+        x1 = c[32] << 8; x2 = c[48]; x3 = c[16]; x4 = c[8];
+        x5 = c[56]; x6 = c[40]; x7 = c[24];
+        if (!(x1 | x2 | x3 | x4 | x5 | x6 | x7)) {
+            int d = (c[0] + 32) >> 6;
+            for (k = 0; k < 8; k++) v[k] = d;
+        } else {
+            x0 = (c[0] << 8) + 8192;
+            x8 = IW7 * (x4 + x5) + 4; x4 = (x8 + (IW1 - IW7) * x4) >> 3; x5 = (x8 - (IW1 + IW7) * x5) >> 3;
+            x8 = IW3 * (x6 + x7) + 4; x6 = (x8 - (IW3 - IW5) * x6) >> 3; x7 = (x8 - (IW3 + IW5) * x7) >> 3;
+            x8 = x0 + x1; x0 -= x1;
+            x1 = IW6 * (x3 + x2) + 4; x2 = (x1 - (IW2 + IW6) * x2) >> 3; x3 = (x1 + (IW2 - IW6) * x3) >> 3;
+            x1 = x4 + x6; x4 -= x6; x6 = x5 + x7; x5 -= x7;
+            x7 = x8 + x3; x8 -= x3; x3 = x0 + x2; x0 -= x2;
+            x2 = (181 * (x4 + x5) + 128) >> 8; x4 = (181 * (x4 - x5) + 128) >> 8;
+            v[0] = (x7 + x1) >> 14; v[1] = (x3 + x2) >> 14; v[2] = (x0 + x4) >> 14; v[3] = (x8 + x6) >> 14;
+            v[4] = (x8 - x6) >> 14; v[5] = (x0 - x4) >> 14; v[6] = (x3 - x2) >> 14; v[7] = (x7 - x1) >> 14;
+        }
+        for (k = 0; k < 8; k++) {
+            int r = v[k];
             if (r < lo) r = lo;
             if (r > hi) r = hi;
-            out[y * 8 + x] = (s16)r;
+            out[k * 8 + i] = (s16)r;
         }
+    }
+}
+
+static void idct_8x8_i64(const s16 *in, s16 *out, int lo, int hi) {
+    long long b[64];
+    int i;
+    for (i = 0; i < 8; i++) {
+        const s16 *r = in + i * 8;
+        long long *o = b + i * 8;
+        long long x0, x1, x2, x3, x4, x5, x6, x7, x8;
+        x1 = (long long)r[4] << 11; x2 = r[6]; x3 = r[2]; x4 = r[1];
+        x5 = r[7]; x6 = r[5]; x7 = r[3];
+        if (!(x1 | x2 | x3 | x4 | x5 | x6 | x7)) {
+            long long dc = r[0] * 8;
+            o[0] = o[1] = o[2] = o[3] = o[4] = o[5] = o[6] = o[7] = dc;
+            continue;
+        }
+        x0 = ((long long)r[0] << 11) + 128;
+        x8 = IW7 * (x4 + x5); x4 = x8 + (IW1 - IW7) * x4; x5 = x8 - (IW1 + IW7) * x5;
+        x8 = IW3 * (x6 + x7); x6 = x8 - (IW3 - IW5) * x6; x7 = x8 - (IW3 + IW5) * x7;
+        x8 = x0 + x1; x0 -= x1;
+        x1 = IW6 * (x3 + x2); x2 = x1 - (IW2 + IW6) * x2; x3 = x1 + (IW2 - IW6) * x3;
+        x1 = x4 + x6; x4 -= x6; x6 = x5 + x7; x5 -= x7;
+        x7 = x8 + x3; x8 -= x3; x3 = x0 + x2; x0 -= x2;
+        x2 = (181 * (x4 + x5) + 128) >> 8; x4 = (181 * (x4 - x5) + 128) >> 8;
+        o[0] = (x7 + x1) >> 8; o[1] = (x3 + x2) >> 8; o[2] = (x0 + x4) >> 8; o[3] = (x8 + x6) >> 8;
+        o[4] = (x8 - x6) >> 8; o[5] = (x0 - x4) >> 8; o[6] = (x3 - x2) >> 8; o[7] = (x7 - x1) >> 8;
+    }
+    for (i = 0; i < 8; i++) {
+        long long *c = b + i;
+        long long x0, x1, x2, x3, x4, x5, x6, x7, x8; int k, v[8];
+        x1 = c[32] << 8; x2 = c[48]; x3 = c[16]; x4 = c[8];
+        x5 = c[56]; x6 = c[40]; x7 = c[24];
+        if (!(x1 | x2 | x3 | x4 | x5 | x6 | x7)) {
+            int d = (int)((c[0] + 32) >> 6);
+            for (k = 0; k < 8; k++) v[k] = d;
+        } else {
+            x0 = (c[0] << 8) + 8192;
+            x8 = IW7 * (x4 + x5) + 4; x4 = (x8 + (IW1 - IW7) * x4) >> 3; x5 = (x8 - (IW1 + IW7) * x5) >> 3;
+            x8 = IW3 * (x6 + x7) + 4; x6 = (x8 - (IW3 - IW5) * x6) >> 3; x7 = (x8 - (IW3 + IW5) * x7) >> 3;
+            x8 = x0 + x1; x0 -= x1;
+            x1 = IW6 * (x3 + x2) + 4; x2 = (x1 - (IW2 + IW6) * x2) >> 3; x3 = (x1 + (IW2 - IW6) * x3) >> 3;
+            x1 = x4 + x6; x4 -= x6; x6 = x5 + x7; x5 -= x7;
+            x7 = x8 + x3; x8 -= x3; x3 = x0 + x2; x0 -= x2;
+            x2 = (181 * (x4 + x5) + 128) >> 8; x4 = (181 * (x4 - x5) + 128) >> 8;
+            v[0] = (int)((x7 + x1) >> 14); v[1] = (int)((x3 + x2) >> 14); v[2] = (int)((x0 + x4) >> 14); v[3] = (int)((x8 + x6) >> 14);
+            v[4] = (int)((x8 - x6) >> 14); v[5] = (int)((x0 - x4) >> 14); v[6] = (int)((x3 - x2) >> 14); v[7] = (int)((x7 - x1) >> 14);
+        }
+        for (k = 0; k < 8; k++) {
+            int r = v[k];
+            if (r < lo) r = lo;
+            if (r > hi) r = hi;
+            out[k * 8 + i] = (s16)r;
+        }
+    }
+}
+
+/* All AC coefficients below 256 in magnitude (nearly every block) fits the
+ * 32-bit passes; anything bigger takes the 64-bit ones. Both match the old
+ * double-precision transform to +-1 (checked over millions of random blocks)
+ * at a fraction of the cost: on the Vita's Cortex-A9 the double version cost
+ * tens of milliseconds a frame and held every FMV well below speed. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define IPU_NEON 1
+#include "ps2_ipu_neon.inc"
+#endif
+
+/* big: nonzero when some AC coefficient is 256 or more in magnitude (the
+ * caller tracks it while placing coefficients). */
+u64 ps2_ipu_blocks, ps2_ipu_flat_blocks;
+static int idct_use_neon = 1;      /* picked by ps2_ipu_bench on the Vita */
+int ps2_ipu_csc_serial;            /* set to keep CSC on the EE thread */
+static int csc_mode = 2;           /* 0 scalar, 1 NEON 32-bit, 2 NEON 16-bit; ditto */
+static void idct_8x8(const s16 *in, s16 *out, int lo, int hi, int big) {
+    if (big) idct_8x8_i64(in, out, lo, hi);
+#ifdef IPU_NEON
+    else if (idct_use_neon) idct_8x8_neon(in, out, lo, hi);
+    else idct_8x8_i32(in, out, lo, hi);
+#else
+    else idct_8x8_i32(in, out, lo, hi);
+#endif
 }
 
 #define IPU_CTRL_RW  0x07FF0000u
@@ -393,7 +549,7 @@ static int decode_block(s16 *out, int cc, int intra, u32 qsc) {
     const u8 *scan = CTRL_AS(ipu_ctrl) ? scan_alt : scan_zigzag;
     const u8 *w = intra ? iq_intra_raster : iq_noni_raster;
     u32 qs = quant_scale(qsc);
-    int n = 0, sum = 0, i;
+    int n = 0, sum = 0, i, big = 0, ac_nz = 0;
     int use15 = intra && CTRL_IVF(ipu_ctrl);
     const s16 *lut = use15 ? dct_lut15 : dct_lut14;
     const u8  *llen = use15 ? dct_len15 : dct_len14;
@@ -424,6 +580,7 @@ static int decode_block(s16 *out, int cc, int intra, u32 qsc) {
                 if (f < -2048) f = -2048;
                 coef[p] = (s16)f;
                 sum += f;
+                if (p) { big |= (f + 255) & ~511; ac_nz |= f; }
             }
             n = 1;
         }
@@ -465,12 +622,28 @@ static int decode_block(s16 *out, int cc, int intra, u32 qsc) {
         if (f < -2048) f = -2048;
         coef[p] = (s16)f;
         sum += f;
+        if (p) { big |= (f + 255) & ~511; ac_nz |= f; }
         n++;
     }
 
-    if (!CTRL_MP1(ipu_ctrl) && !(sum & 1)) coef[63] ^= 1;
+    if (!CTRL_MP1(ipu_ctrl) && !(sum & 1)) {
+        coef[63] ^= 1;
+        big |= (coef[63] + 255) & ~511;
+    }
 
-    idct_8x8(coef, out, intra ? 0 : -256, intra ? 255 : 255);
+    ps2_ipu_blocks++;
+    if (!ac_nz) {
+        /* Only the DC term (plus the +-1 mismatch toggle at 63, which moves
+         * no pixel by more than the rounding): a flat block. The full
+         * transform gives (dc + 4) >> 3 everywhere for a lone DC. */
+        int v = (coef[0] + 4) >> 3, lo = intra ? 0 : -256;
+        if (v < lo) v = lo;
+        if (v > 255) v = 255;
+        for (i = 0; i < 64; i++) out[i] = (s16)v;
+        ps2_ipu_flat_blocks++;
+        return 1;
+    }
+    idct_8x8(coef, out, intra ? 0 : -256, intra ? 255 : 255, big);
     return 1;
 }
 
@@ -488,9 +661,11 @@ static int decode_macroblock(s16 *y, s16 *cb, s16 *cr, int intra, u32 cbp,
                              u32 qsc, int field) {
     s16 blk[64];
     int b;
-    memset(y, 0, 256 * sizeof(s16));
-    memset(cb, 0, 64 * sizeof(s16));
-    memset(cr, 0, 64 * sizeof(s16));
+    if ((cbp & 0x3Fu) != 0x3Fu) {
+        memset(y, 0, 256 * sizeof(s16));
+        memset(cb, 0, 64 * sizeof(s16));
+        memset(cr, 0, 64 * sizeof(s16));
+    }
     for (b = 0; b < 6; b++) {
         int coded = (cbp >> (5 - b)) & 1u;
         if (!coded) continue;
@@ -568,23 +743,44 @@ static u32 vq_index(u16 c) {
     return (u32)best;
 }
 
+static void emit_rgb_to(const s16 *y, const s16 *cb, const s16 *cr,
+                        int ofm, int dte, int sgn, u8 *dst);
 static void emit_rgb(const s16 *y, const s16 *cb, const s16 *cr,
                      int ofm, int dte, int sgn) {
-    u32 rgb[256];
+    u32 tmp[256];
+    emit_rgb_to(y, cb, cr, ofm, dte, sgn, (u8 *)tmp);
+    out_push(tmp, ofm ? 512u : 1024u);
+}
+static void emit_rgb_to(const s16 *y, const s16 *cb, const s16 *cr,
+                        int ofm, int dte, int sgn, u8 *dst) {
+    u32 rgb_local[256];
+    /* 32-bit output goes straight into the destination (4-byte aligned) */
+    u32 *rgb = (!ofm && !((uintptr_t)dst & 3u)) ? (u32 *)dst : rgb_local;
     int j, i;
+#ifdef IPU_NEON
+    if (csc_mode == 2) csc_rgb_neon16(y, cb, cr, rgb, sgn);
+    else if (csc_mode == 1) csc_rgb_neon(y, cb, cr, rgb, sgn);
+    else
+        for (j = 0; j < 16; j++)
+            for (i = 0; i < 16; i++) {
+                int c = (j >> 1) * 8 + (i >> 1);
+                rgb[j * 16 + i] = csc_pixel(y[j * 16 + i], cb[c], cr[c], sgn);
+            }
+#else
     for (j = 0; j < 16; j++)
         for (i = 0; i < 16; i++) {
             int c = (j >> 1) * 8 + (i >> 1);
             rgb[j * 16 + i] = csc_pixel(y[j * 16 + i], cb[c], cr[c], sgn);
         }
+#endif
     if (!ofm) {
-        out_push(rgb, sizeof rgb);
+        if (rgb != (u32 *)dst) memcpy(dst, rgb, 1024);
     } else {
         u16 p16[256];
         for (j = 0; j < 16; j++)
             for (i = 0; i < 16; i++)
                 p16[j * 16 + i] = rgb32_to_rgb16(rgb[j * 16 + i], i, j, dte);
-        out_push(p16, sizeof p16);
+        memcpy(dst, p16, sizeof p16);
     }
 }
 
@@ -722,6 +918,84 @@ static void cmd_idec(u32 opt) {
     in_compact();
 }
 
+#if defined(PS2_VITA) && defined(IPU_NEON)
+/* CSC is a whole picture's colour conversion (1,120 macroblocks for a
+ * 640x448 frame) done while the game waits. A helper on core 2 -- idle
+ * during movies -- takes chunks of it alongside the EE thread; both pull
+ * chunks from one counter, so a late helper just leaves more to the EE. */
+#include <pthread.h>
+void vita_pin_current(int core);
+void vita_set_priority(int prio);
+static struct {
+    const u8 *src; u8 *dst;
+    u32 total, per, ofm, dte;
+    u32 next, done;      /* atomics */
+    u32 seq;
+} cscj;
+static pthread_mutex_t csc_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t csc_cv = PTHREAD_COND_INITIALIZER;
+static int csc_helper_state;     /* 0 not started, 1 running, -1 failed */
+u64 ps2_ipu_csc_helper_mbs, ps2_ipu_csc_mbs;
+#define CSC_CHUNK 16u
+static u32 csc_work(void) {
+    u32 did = 0;
+    for (;;) {
+        u32 a = __atomic_fetch_add(&cscj.next, CSC_CHUNK, __ATOMIC_ACQ_REL), b, m;
+        if (a >= cscj.total) break;
+        b = a + CSC_CHUNK < cscj.total ? a + CSC_CHUNK : cscj.total;
+        for (m = a; m < b; m++) {
+            s16 y[256], cb[64], cr[64];
+            csc_unpack_neon(cscj.src + (size_t)m * 384u, y, cb, cr);
+            emit_rgb_to(y, cb, cr, (int)cscj.ofm, (int)cscj.dte, 0,
+                        cscj.dst + (size_t)m * cscj.per);
+        }
+        __atomic_fetch_add(&cscj.done, b - a, __ATOMIC_ACQ_REL);
+        did += b - a;
+    }
+    return did;
+}
+static void *csc_helper(void *unused) {
+    u32 seen = 0;
+    (void)unused;
+    vita_pin_current(2);
+    vita_set_priority(141);
+    pthread_mutex_lock(&csc_mx);
+    for (;;) {
+        while (cscj.seq == seen) pthread_cond_wait(&csc_cv, &csc_mx);
+        seen = cscj.seq;
+        pthread_mutex_unlock(&csc_mx);
+        ps2_ipu_csc_helper_mbs += csc_work();
+        pthread_mutex_lock(&csc_mx);
+    }
+    return NULL;
+}
+static int csc_parallel(const u8 *src, u32 mbc, int ofm, int dte) {
+    u32 per = ofm ? 512u : 1024u;
+    u8 *dst;
+    if (csc_helper_state == 0) {
+        pthread_t t;
+        csc_helper_state = pthread_create(&t, NULL, csc_helper, NULL) == 0 ? 1 : -1;
+        if (csc_helper_state > 0) pthread_detach(t);
+        ps2_log("ipu: colour conversion helper thread %s",
+                csc_helper_state > 0 ? "started on core 2" : "could not start");
+    }
+    if (csc_helper_state < 0) return 0;
+    dst = out_grow(mbc * per);
+    pthread_mutex_lock(&csc_mx);
+    cscj.src = src; cscj.dst = dst; cscj.total = mbc; cscj.per = per;
+    cscj.ofm = (u32)ofm; cscj.dte = (u32)dte;
+    __atomic_store_n(&cscj.done, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&cscj.next, 0u, __ATOMIC_RELEASE);
+    cscj.seq++;
+    pthread_cond_signal(&csc_cv);
+    pthread_mutex_unlock(&csc_mx);
+    csc_work();
+    while (__atomic_load_n(&cscj.done, __ATOMIC_ACQUIRE) < mbc) { /* helper finishing its chunk */ }
+    ps2_ipu_csc_mbs += mbc;
+    return 1;
+}
+#endif
+
 static void cmd_csc(u32 opt) {
     u32 mbc = opt & 0x7FFu;
     int dte = (int)((opt >> 26) & 1u);
@@ -733,12 +1007,28 @@ static void cmd_csc(u32 opt) {
         return;
     }
     out_reset();
+#if defined(PS2_VITA) && defined(IPU_NEON)
+    if (mbc >= 64u && !(in_bit & 7u) && !ps2_ipu_csc_serial
+        && csc_parallel(in_buf + (u32)(in_bit >> 3), mbc, ofm, dte)) {
+        in_bit += (u64)mbc * 384u * 8u;
+        in_compact();
+        return;
+    }
+#endif
     for (m = 0; m < mbc; m++) {
         s16 y[256], cb[64], cr[64];
         int i;
-        for (i = 0; i < 256; i++) y[i] = (s16)bit_get(8);
-        for (i = 0; i < 64; i++) cb[i] = (s16)bit_get(8);
-        for (i = 0; i < 64; i++) cr[i] = (s16)bit_get(8);
+#ifdef IPU_NEON
+        if (!(in_bit & 7u)) {     /* byte-aligned: read the samples directly */
+            csc_unpack_neon(in_buf + (u32)(in_bit >> 3), y, cb, cr);
+            in_bit += 384u * 8u;
+        } else
+#endif
+        {
+            for (i = 0; i < 256; i++) y[i] = (s16)bit_get(8);
+            for (i = 0; i < 64; i++) cb[i] = (s16)bit_get(8);
+            for (i = 0; i < 64; i++) cr[i] = (s16)bit_get(8);
+        }
         {   static int shown;
             if (!shown) {
                 shown = 1;
@@ -790,7 +1080,31 @@ static void cmd_pack(u32 opt) {
     in_compact();
 }
 
+u64 ps2_ipu_busy_us, ps2_ipu_mb_count;   /* read by the Vita status log */
+u64 ps2_ipu_cmd_us[16], ps2_ipu_cmd_n[16], ps2_ipu_retries;
+static void ipu_run_inner(u32 cmd);
 static void ipu_run(u32 cmd) {
+    struct timespec a, b;
+    u64 mb0 = stat_mb;
+    u32 code = cmd >> 28;
+    /* the bit-peek commands run ~40,000 times a second during a movie and
+     * are tiny; timing them cost more than running them */
+    if (code != IPU_BDEC && code != IPU_IDEC && code != IPU_CSC && code != IPU_PACK) {
+        ipu_run_inner(cmd);
+        ps2_ipu_cmd_n[code]++;
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    ipu_run_inner(cmd);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    {   u64 us = (u64)((b.tv_sec - a.tv_sec) * 1000000ll + (b.tv_nsec - a.tv_nsec) / 1000);
+        ps2_ipu_busy_us += us;
+        ps2_ipu_cmd_us[cmd >> 28] += us;
+        ps2_ipu_cmd_n[cmd >> 28]++;
+    }
+    ps2_ipu_mb_count += stat_mb - mb0;
+}
+static void ipu_run_inner(u32 cmd) {
     u32 code = cmd >> 28, opt = cmd & 0x0FFFFFFFu;
     tables_init();
     stat_cmd[code]++;
@@ -859,11 +1173,32 @@ static void cmd_log_report(void) {
 }
 
 static void ipu_command(u32 cmd) {
+    u32 tries = 0;
     cmd_log_push(cmd);
     ipu_pending = 0;
+    /* FDEC/VDEC (bit peeks and VLC reads -- ~70,000 a second in a movie)
+     * cannot starve when the FIFO holds skip + 32 bits and more; run them
+     * without the snapshot/retry machinery. */
+    {   u32 code = cmd >> 28;
+        if ((code == IPU_FDEC || code == IPU_VDEC) && bit_avail() >= 64u + 32u) {
+            ipu_starved = 0;
+            ipu_need_qw = 0;
+            ipu_cmd_active = 1;
+            ipu_run_inner(cmd);
+            ipu_cmd_active = 0;
+            ps2_ipu_cmd_n[code]++;
+            if (!ipu_starved) {
+                ipu_in_command = 0;
+                ps2_dmac_ipu_drain();
+                return;
+            }
+            /* cannot happen with that many bits; fall through and retry */
+        }
+    }
     ipu_in_command = 1;
     for (;;) {
         u32 before;
+        snap_code = cmd >> 28;
         snap_save(&cmd_snap);
         ipu_starved = 0;
         ipu_need_qw = 0;
@@ -890,6 +1225,13 @@ static void ipu_command(u32 cmd) {
         }
         snap_restore(&cmd_snap);
         ipu_pending = 1;
+        /* A starved command is re-run from the start once more input is in,
+         * so feeding it one FIFO's worth (8 qwords) at a time re-decoded a
+         * large macroblock several times over. Commands that know their
+         * size ask for it; the rest get a growing amount per retry. */
+        if (!ipu_need_qw) ipu_need_qw = 8u << (tries < 5u ? tries : 5u);
+        tries++;
+        ps2_ipu_retries++;
         before = in_len;
         ps2_dmac_ipu_pull();
         if (in_len == before) {
@@ -1215,3 +1557,125 @@ int ps2_ipu_selftest(const char *path, int max_frames) {
     free(data);
     return bad;
 }
+
+#ifdef PS2_VITA
+/* Start-up benchmark (Vita): a few hard numbers from the real hardware, so
+ * the next optimisation is aimed by measurement rather than guesswork.
+ * Runs before the game starts; ps2_main's ps2_ipu_init() resets the state
+ * it touches. */
+#include "ps2_ipu_bench.inc"
+u64 vita_tsc(void);
+static u64 bench_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000ull + (u64)t.tv_nsec / 1000u;
+}
+void ps2_ipu_bench(void) {
+    u64 t0, t1, mbs = 0, sink = 0;
+    u32 i, rep;
+    tables_init();
+    t0 = bench_us();
+    for (i = 0; i < 20000; i++) sink += vita_tsc();
+    t1 = bench_us();
+    ps2_log("bench: process-time timer %.2f us per call", (double)(t1 - t0) / 20000.0);
+    t0 = bench_us();
+    for (i = 0; i < 20000; i++) sink += bench_us();
+    t1 = bench_us();
+    ps2_log("bench: clock_gettime %.2f us per call", (double)(t1 - t0) / 20000.0);
+    {   s16 blk[64], o[64];
+        for (i = 0; i < 64; i++) blk[i] = (s16)((i * 37) % 23 - 11);
+        blk[0] = 400;
+        t0 = bench_us();
+        for (i = 0; i < 50000; i++) { blk[1] = (s16)(i & 63); idct_8x8(blk, o, 0, 255, 0); sink += o[5]; }
+        t1 = bench_us();
+        ps2_log("bench: IDCT %.2f us per 8x8 block", (double)(t1 - t0) / 50000.0);
+    }
+    {   ipu_snap k;
+        t0 = bench_us();
+        for (i = 0; i < 20000; i++) { snap_save(&k); snap_restore(&k); }
+        t1 = bench_us();
+        ps2_log("bench: IPU snapshot save+restore %.2f us", (double)(t1 - t0) / 20000.0);
+    }
+    ipu_ctrl = 1u << 21;            /* MPEG-2, intra VLC table 1 */
+    ipu_th0 = ipu_th1 = 0;
+    {   double per[2] = { 0, 0 };
+        int mode;
+        for (mode = 0; mode < 2; mode++) {
+            idct_use_neon = mode;
+            mbs = 0;
+            t0 = bench_us();
+            for (rep = 0; rep < 2; rep++) {
+        const u8 *d = ipu_bench_m2v;
+        u32 n = sizeof ipu_bench_m2v, j;
+        for (j = 0; j + 4 < n; j++) {
+            if (d[j] == 0 && d[j + 1] == 0 && d[j + 2] == 1 && d[j + 3] >= 1 && d[j + 3] <= 0xAF) {
+                u32 s = j + 4, e = s, len, q;
+                u64 mb0;
+                while (e + 3 < n && !(d[e] == 0 && d[e + 1] == 0 && d[e + 2] == 1)) e++;
+                if (e + 3 >= n) e = n;
+                len = e - s;
+                in_reserve(len + 64);
+                if (!in_buf) break;
+                memcpy(in_buf, d + s, len);
+                memset(in_buf + len, 0, 64);
+                in_buf[len + 2] = 1; in_buf[len + 3] = 0xB7;
+                in_len = len + 16u; in_bit = 0;
+                q = (in_buf[0] >> 3) & 31u;
+                mb0 = stat_mb;
+                cmd_idec(6u | (q << 16));
+                mbs += stat_mb - mb0;
+                j = e - 1;
+            }
+        }
+            }
+            t1 = bench_us();
+            per[mode] = mbs ? (double)(t1 - t0) / (double)mbs : 1e9;
+        }
+        idct_use_neon = per[1] <= per[0];
+        ps2_log("bench: intra decode with scalar IDCT %.1f us/macroblock, with NEON IDCT %.1f -- using %s",
+                per[0], per[1], idct_use_neon ? "NEON" : "scalar");
+        {   s16 blk[64], o[64];
+            memset(blk, 0, sizeof blk);
+            blk[0] = 400; blk[1] = 12; blk[8] = -7; blk[63] = 1;
+            for (mode = 0; mode < 2; mode++) {
+                idct_use_neon = mode;
+                t0 = bench_us();
+                for (i = 0; i < 50000; i++) { blk[2] = (s16)(i & 15); idct_8x8(blk, o, 0, 255, 0); sink += o[5]; }
+                t1 = bench_us();
+                ps2_log("bench: %s IDCT %.2f us per sparse block", mode ? "NEON" : "scalar",
+                        (double)(t1 - t0) / 50000.0);
+            }
+            idct_use_neon = per[1] <= per[0];
+        }
+    }
+    {   s16 y[256], cb[64], cr[64];
+        for (i = 0; i < 256; i++) y[i] = (s16)(i & 255);
+        for (i = 0; i < 64; i++) { cb[i] = (s16)(100 + i); cr[i] = (s16)(150 - i); }
+        double best = 1e9, us[3];
+        int m, pick = 2;
+        for (m = 0; m < 3; m++) {
+            csc_mode = m;
+            t0 = bench_us();
+            for (i = 0; i < 4000; i++) { out_reset(); emit_rgb(y, cb, cr, 0, 0, 0); }
+            t1 = bench_us();
+            us[m] = (double)(t1 - t0) / 4000.0;
+            if (us[m] < best) { best = us[m]; pick = m; }
+        }
+        csc_mode = pick;
+        ps2_log("bench: colour convert per macroblock: scalar %.2f us, NEON-32 %.2f, NEON-16 %.2f -- using %s",
+                us[0], us[1], us[2], pick == 2 ? "NEON-16" : pick == 1 ? "NEON-32" : "scalar");
+    }
+    {   static u8 a[1 << 20], b[1 << 20];
+        t0 = bench_us();
+        for (i = 0; i < 20; i++) { memcpy(a, b, sizeof a); b[i] = (u8)i; }
+        t1 = bench_us();
+        ps2_log("bench: memcpy %.0f MB/s", 20.0 * 1e6 / (double)(t1 - t0 ? t1 - t0 : 1));
+        sink += a[7];
+    }
+    in_len = 0; in_bit = 0; out_reset();
+    stat_mb = stat_err = 0;
+    memset(stat_cmd, 0, sizeof stat_cmd);
+    ipu_ctrl = 0;
+    if (sink == 0x123456789ull) ps2_log("bench: %llu", (unsigned long long)sink);
+}
+#endif

@@ -33,3 +33,10 @@ tests/mods/mount_test/
 tests/mods/archive_test/
 tests/mods/bgm_test/
 tests/mods_resize/
+
+# Vita port: build output, official LiveArea art, game-derived VU1 programs
+build-vita/
+platform/vita/assets/
+runtime/src/ps2_vu1_progs.inc
+*.vpk
+*.iso

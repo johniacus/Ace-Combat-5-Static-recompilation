@@ -1,5 +1,13 @@
 #include "ps2_runtime.h"
 
+#ifdef PS2_VITA
+/* ARM has no rdtsc here: time the phase profiler with the process clock. */
+u64 vita_tsc(void);
+#undef ps2_tsc
+#define ps2_tsc() vita_tsc()
+#endif
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -26,8 +34,69 @@ u32 ps2_trace_pos;
 
 static FILE *ps2_logfp;
 
+#ifdef PS2_VITA
+/* Writing the log went straight to the memory card with a flush per line,
+ * on whichever thread logged: a slow-field report cost the GS thread 40-60
+ * ms, a visible freeze of its own (build 89). Lines now go into a buffer
+ * that a low-priority thread writes out. AC5_LOG_SYNC=1 writes directly. */
+#include <psp2/kernel/threadmgr.h>
+#define LOG_RING (512u * 1024u)
+static char *log_ring;
+static u32 log_head, log_tail, log_dropped;
+static pthread_mutex_t log_mx = PTHREAD_MUTEX_INITIALIZER;
+static int log_mode;    /* 0 unset, 1 async, -1 direct */
+static void *log_writer(void *u) {
+    static char out[64 * 1024];
+    (void)u;
+    {   extern void vita_set_priority(int prio); vita_set_priority(200); }
+    for (;;) {
+        u32 n = 0, dropped;
+        sceKernelDelayThread(100 * 1000);
+        for (;;) {
+            pthread_mutex_lock(&log_mx);
+            n = log_head - log_tail;
+            if (n > sizeof out) n = sizeof out;
+            for (u32 i = 0; i < n; i++) out[i] = log_ring[(log_tail + i) % LOG_RING];
+            log_tail += n;
+            dropped = log_dropped; log_dropped = 0;
+            pthread_mutex_unlock(&log_mx);
+            if (dropped) fprintf(ps2_logfp ? ps2_logfp : stderr, "log: %u lines dropped (buffer full)\n", dropped);
+            if (!n) break;
+            fwrite(out, 1, n, ps2_logfp ? ps2_logfp : stderr);
+        }
+        fflush(ps2_logfp ? ps2_logfp : stderr);
+    }
+    return NULL;
+}
+static int log_async_put(const char *line, u32 n) {
+    if (!log_mode) {
+        pthread_mutex_lock(&log_mx);
+        if (!log_mode) {
+            const char *e = getenv("AC5_LOG_SYNC");
+            pthread_t th;
+            log_mode = -1;
+            if (!(e && *e == '1') && (log_ring = (char *)malloc(LOG_RING)) != NULL
+                && pthread_create(&th, NULL, log_writer, NULL) == 0) {
+                pthread_detach(th);
+                log_mode = 1;
+            }
+        }
+        pthread_mutex_unlock(&log_mx);
+    }
+    if (log_mode < 0) return 0;
+    pthread_mutex_lock(&log_mx);
+    if (log_head - log_tail + n > LOG_RING) log_dropped++;
+    else {
+        for (u32 i = 0; i < n; i++) log_ring[(log_head + i) % LOG_RING] = line[i];
+        log_head += n;
+    }
+    pthread_mutex_unlock(&log_mx);
+    return 1;
+}
+#endif
+
 void ps2_log(const char *fmt, ...) {
-    char line[1024];
+    char line[3072];
     int n;
     va_list ap;
     if (!ps2_logfp) ps2_logfp = stderr;
@@ -38,6 +107,9 @@ void ps2_log(const char *fmt, ...) {
     if (n > (int)sizeof(line) - 3) n = (int)sizeof(line) - 3;
     line[n] = '\n';
     line[n + 1] = 0;
+#ifdef PS2_VITA
+    if (log_async_put(line, (u32)n + 1u)) return;
+#endif
     fwrite(line, 1, (size_t)n + 1, ps2_logfp);
     fflush(ps2_logfp);
 }
@@ -610,6 +682,24 @@ u64 ps2_phase_cycles[PS2_PH_N];
 u64 ps2_phase_self[PS2_PH_N];
 u64 ps2_phase_calls[PS2_PH_N];
 int ps2_phase_on;
+static int ps2_phase_enabled;
+static u64 ps2_phase_sampled;
+/* The timer behind the phase profiler is a system call on the Vita, and
+ * the worker crosses ~3,500 phase boundaries a field in a 3D scene, so
+ * timing every field cost several ms of the very work it measured. Time
+ * one field in PS2_PHASE_EVERY instead and scale by the sampled count. */
+#ifdef PS2_VITA
+#define PS2_PHASE_EVERY 8u
+#else
+#define PS2_PHASE_EVERY 1u
+#endif
+void ps2_phase_field_tick(void) {
+    static u32 n;
+    if (!ps2_phase_enabled) return;
+    n++;
+    ps2_phase_on = (n % PS2_PHASE_EVERY) == 0u;
+    if (ps2_phase_on) ps2_phase_sampled++;
+}
 __thread u64 ps2_phase_child;
 static u64 ps2_phase_t0;
 static double ps2_phase_wall0;
@@ -617,7 +707,8 @@ static double ps2_phase_hz;
 
 void ps2_phase_init(void) {
     const char *e = getenv("PS2_PROFILE_PHASES");
-    ps2_phase_on = e && *e && *e != '0';
+    ps2_phase_enabled = e && *e && *e != '0';
+    ps2_phase_on = ps2_phase_enabled && PS2_PHASE_EVERY == 1u;
     memset(ps2_phase_cycles, 0, sizeof ps2_phase_cycles);
     memset(ps2_phase_self, 0, sizeof ps2_phase_self);
     memset(ps2_phase_calls, 0, sizeof ps2_phase_calls);
@@ -643,7 +734,8 @@ void ps2_phase_report(u64 fields) {
     u64 span = now - ps2_phase_t0;
     double secs = ps2_wall_seconds() - ps2_phase_wall0;
     int i;
-    if (!ps2_phase_on) return;
+    if (!ps2_phase_enabled) return;
+    if (PS2_PHASE_EVERY != 1u) fields = ps2_phase_sampled;
     ps2_log("---- phase profile (%.1f s wall, %llu fields = %.1f fields/s) ----",
             secs, (unsigned long long)fields,
             secs > 0.0 ? (double)fields / secs : 0.0);
@@ -675,6 +767,39 @@ void ps2_phase_report(u64 fields) {
             "VU1 row with no VIF");
     ps2_log("    parent, so that row can exceed the VIF walker if this title "
             "drives VU0.)");
+}
+
+/* One-line phase profile of the last window, then start a new window
+ * (periodic log on the Vita). ms are per field, self time. */
+void ps2_phase_window(u64 fields) {
+    static const char *nm[PS2_PH_N] = {
+        "gfxq", "VIF", "UNPACK", "VU1", "GIF", "imageXfer", "prim", "texture",
+        "drawlist", "DMAC", "replay" };
+    static u64 last_fields;
+    u64 now = ps2_tsc(), span = now - ps2_phase_t0;
+    double secs = ps2_wall_seconds() - ps2_phase_wall0;
+    static u64 last_sampled;
+    u64 nf = fields - last_fields;
+    char line[600];
+    int len, i;
+    if (PS2_PHASE_EVERY != 1u) nf = ps2_phase_sampled - last_sampled;
+    last_sampled = ps2_phase_sampled;
+    if (!ps2_phase_enabled || !nf || !span) { last_fields = fields; return; }
+    len = snprintf(line, sizeof line, "phases (worker self ms/field, %llu fields timed):",
+                   (unsigned long long)nf);
+    for (i = 0; i < PS2_PH_N && len < (int)sizeof line - 40; i++) {
+        if (!ps2_phase_calls[i]) continue;
+        len += snprintf(line + len, sizeof line - (size_t)len, " %s %.2f (%.0f/f)", nm[i],
+                        phase_ms(ps2_phase_self[i], secs, span) / (double)nf,
+                        (double)ps2_phase_calls[i] / (double)nf);
+    }
+    ps2_log("%s", line);
+    memset(ps2_phase_cycles, 0, sizeof ps2_phase_cycles);
+    memset(ps2_phase_self, 0, sizeof ps2_phase_self);
+    memset(ps2_phase_calls, 0, sizeof ps2_phase_calls);
+    ps2_phase_t0 = now;
+    ps2_phase_wall0 = ps2_wall_seconds();
+    last_fields = fields;
 }
 
 double ps2_wall_seconds(void) {
@@ -729,6 +854,40 @@ void ps2_sampler_start(void) {
     if (pthread_create(&samp_thread, NULL, samp_main, NULL) != 0)
         samp_running = 0;
 #endif
+}
+
+/* Print the hottest guest functions seen since the last call and start a
+ * new window; the sampler keeps running (for periodic logs on the Vita). */
+void ps2_sampler_window(unsigned top) {
+    unsigned i, j, n = 0, cnt = samp_n;
+    u32 idx[32];
+    u64 total = samp_total;
+    if (!samp_running || !total) return;
+    if (top > 32) top = 32;
+    for (i = 0; i < cnt; i++) {
+        for (j = 0; j < n; j++) if (samp[i].n > samp[idx[j]].n) break;
+        if (j == top) continue;
+        if (n < top) n++;
+        for (unsigned k = n - 1; k > j; k--) idx[k] = idx[k - 1];
+        idx[j] = i;
+    }
+    {   char line[512];
+        int len = snprintf(line, sizeof line, "guest profile (%llu samples):",
+                           (unsigned long long)total);
+        for (i = 0; i < n && len < (int)sizeof line - 48; i++) {
+            const char *nm = ps2_symbol_name(samp[idx[i]].addr);
+            if (nm)
+                len += snprintf(line + len, sizeof line - (size_t)len, " %.0f%% %s",
+                                100.0 * (double)samp[idx[i]].n / (double)total, nm);
+            else    /* unnamed: give the address so it can be found */
+                len += snprintf(line + len, sizeof line - (size_t)len, " %.0f%% @%08X",
+                                100.0 * (double)samp[idx[i]].n / (double)total,
+                                samp[idx[i]].addr);
+        }
+        ps2_log("%s", line);
+    }
+    samp_n = 0;
+    samp_total = 0;
 }
 
 void ps2_sampler_report(unsigned top) {

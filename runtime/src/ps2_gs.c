@@ -1,4 +1,16 @@
+#ifdef PS2_VITA
+#include <psp2/kernel/processmgr.h>
+#endif
 #include "ps2_runtime.h"
+#include "ps2_gsq.h"
+
+#ifdef PS2_VITA
+/* ARM has no rdtsc here: time the phase profiler with the process clock. */
+u64 vita_tsc(void);
+#undef ps2_tsc
+#define ps2_tsc() vita_tsc()
+#endif
+
 extern int ps2_gif_path;
 #include "ps2_vk.h"
 #include "ps2_settings.h"
@@ -558,10 +570,52 @@ static void vram_watch_init(void) {
 }
 
 static void vram_store_b(u32 off, u64 bit, u32 psm, u32 bits, u32 v);
+/* Re-uploads of an unchanged image. Menus upload the same pictures every
+ * field; marking their pages dirty each time made every texture on them
+ * re-validate, re-hash and often re-decode. When an upload lands on pages
+ * whose last writer was an upload of the same buffer, the begin-of-transfer
+ * dirty is held back until a byte actually changes (trx_touch); if none
+ * does, the transfer leaves the pages' epochs alone. */
+static int trx_dirty_pending, trx_changed = 1;
+static u32 trx_pend[7];
+u64 ps2_gs_trx_unchanged, ps2_gs_trx_changed, ps2_gs_trx_skipped_px;
+static void gs_dirty_rect(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y, u32 w, u32 h);
+static void trx_touch_inner(void);
+static void trx_touch(void) {
+    extern volatile u8 ps2_gs_ph;
+    u8 sv = ps2_gs_ph;
+    ps2_gs_ph = 44;
+    trx_touch_inner();
+    ps2_gs_ph = sv;
+}
+static void trx_touch_inner(void) {
+    if (trx_dirty_pending) {
+        trx_dirty_pending = 0;
+        gs_dirty_rect(trx_pend[0], trx_pend[1], trx_pend[2], trx_pend[3],
+                      trx_pend[4], trx_pend[5], trx_pend[6]);
+    }
+    trx_changed = 1;
+}
+static void vram_store_b_raw(u32 off, u64 bit, u32 psm, u32 bits, u32 v);
+static void vram_store_b(u32 off, u64 bit, u32 psm, u32 bits, u32 v) {
+    u8 old[4];
+    if (PS2_LIKELY(!trx_dirty_pending) || off + 4u > GS_VRAM_SIZE) {
+        if (PS2_UNLIKELY(trx_dirty_pending)) trx_touch();
+        vram_store_b_raw(off, bit, psm, bits, v);
+        return;
+    }
+    memcpy(old, gs_vram + off, 4);
+    vram_store_b_raw(off, bit, psm, bits, v);
+    if (memcmp(old, gs_vram + off, 4)) {
+        memcpy(gs_vram + off, old, 4);    /* let the dirty see the old page */
+        trx_touch();
+        vram_store_b_raw(off, bit, psm, bits, v);
+    }
+}
 static void vram_store(u32 off, u64 bit, u32 psm, u32 v) {
     vram_store_b(off, bit, psm, psm_bits(psm), v);
 }
-static void vram_store_b(u32 off, u64 bit, u32 psm, u32 bits, u32 v) {
+static void vram_store_b_raw(u32 off, u64 bit, u32 psm, u32 bits, u32 v) {
     u32 w;
     switch (bits) {
     case 4:
@@ -629,10 +683,12 @@ static u32 fb_mask(void) { return (u32)(frame_reg() >> 32); }
 static u32 zb_base(void) { return (u32)(zbuf_reg() & 0x1FFull) * 2048u * 4u; }
 static u32 zb_enabled(void) { return ((zbuf_reg() >> 32) & 1ull) == 0ull; }
 
-u64 ps2_gs_cur_tex0(void) { return tex0_reg(); }
-u64 ps2_gs_cur_frame(void) { return frame_reg(); }
-u64 ps2_gs_cur_zbuf(void) { return zbuf_reg(); }
-u64 ps2_gs_cur_test(void) { return test_reg(); }
+/* Read from the worker while the GS runs on its own thread, these wait for
+ * the GS to catch up first (none of the worker's code is expected to). */
+u64 ps2_gs_cur_tex0(void) { if (PS2_GSQ_DEFER()) ps2_gsq_sync("cur_tex0"); return tex0_reg(); }
+u64 ps2_gs_cur_frame(void) { if (PS2_GSQ_DEFER()) ps2_gsq_sync("cur_frame"); return frame_reg(); }
+u64 ps2_gs_cur_zbuf(void) { if (PS2_GSQ_DEFER()) ps2_gsq_sync("cur_zbuf"); return zbuf_reg(); }
+u64 ps2_gs_cur_test(void) { if (PS2_GSQ_DEFER()) ps2_gsq_sync("cur_test"); return test_reg(); }
 
 static u32 gs_tex_lod(void) {
     u64 t1 = tex1_reg();
@@ -865,6 +921,7 @@ static float z_norm(u32 z);
 static float z_norm_d(double z, int z32);
 
 void ps2_gs_native_vertex(float x, float y, double z, float fog, int kind, int adc) {
+    if (PS2_GSQ_DEFER()) { ps2_gsq_nvertex(x, y, z, fog, kind, adc); return; }
     u64 off = xyoff_reg();
     float ox = (float)(off & 0xFFFFull) / 16.0f;
     float oy = (float)((off >> 32) & 0xFFFFull) / 16.0f;
@@ -1084,8 +1141,25 @@ static int blk_mark(u32 blk, void *u) {
     return 0;
 }
 
+u64 ps2_gs_dirty_us, ps2_gs_img_calls;
+extern int ac5_prof;
+static void gs_dirty_rect_inner(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y, u32 w, u32 h);
 static void gs_dirty_rect(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y,
                           u32 w, u32 h) {
+    extern volatile u8 ps2_gs_ph;
+    u8 ph_sv = ps2_gs_ph;
+    ps2_gs_ph = 43;
+#ifdef PS2_VITA
+    u64 t0 = ac5_prof ? sceKernelGetProcessTimeWide() : 0;
+    gs_dirty_rect_inner(dbp, dbw, dpsm, x, y, w, h);
+    if (ac5_prof) ps2_gs_dirty_us += sceKernelGetProcessTimeWide() - t0;
+#else
+    gs_dirty_rect_inner(dbp, dbw, dpsm, x, y, w, h);
+#endif
+    ps2_gs_ph = ph_sv;
+}
+static void gs_dirty_rect_inner(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y,
+                                u32 w, u32 h) {
     gs_geom g;
     u32 ppr, first, last;
     if (!w || !h) return;
@@ -1104,6 +1178,48 @@ static void gs_dirty_rect(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y,
     gs_mark_dirty(dbp + first * GS_PAGE_BYTES,
                   dbp + (last + 1u) * GS_PAGE_BYTES);
     gs_dirty_owner = 0;
+}
+
+/* An upload that changed nothing still hands its blocks to the new upload
+ * record, so a later overwrite marks the right record lost. */
+static void trx_unchanged_done_inner(void);
+static void trx_unchanged_done(void) {
+    extern volatile u8 ps2_gs_ph;
+    u8 sv = ps2_gs_ph;
+    ps2_gs_ph = 45;
+    trx_unchanged_done_inner();
+    ps2_gs_ph = sv;
+}
+static void trx_unchanged_done_inner(void) {
+    trx_dirty_pending = 0;
+    if (blk_marking != 0xFFFFFFFFu)
+        blk_walk(trx_pend[0], trx_pend[1], trx_pend[2], trx_pend[3],
+                 trx_pend[4], trx_pend[5], trx_pend[6], blk_mark, NULL);
+}
+
+/* Every page the upload covers was last written by an upload to the same
+ * buffer (base, width, format): only then may its dirty be held back. */
+static int trx_reupload(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y, u32 w, u32 h) {
+    gs_geom g;
+    u32 ppr, first, last, p, lo, hi;
+    static int off = -1;
+    if (off < 0) off = PS2_ENV("AC5_NO_REUPLOAD_SKIP") ? 1 : 0;
+    if (off || !w || !h || PS2_ENV("PS2_TRACE_MPEG")) return 0;
+    gs_psm_geom(dpsm, &g);
+    if (!dbw) dbw = g.pw;
+    ppr = dbw / g.pw;
+    if (!ppr) ppr = 1;
+    first = (y / g.ph) * ppr + (x / g.pw);
+    last  = gs_page_span(&g, dbw, x + w - 1u, y + h - 1u) - 1u;
+    if (last < first) last = first;
+    lo = (dbp + first * GS_PAGE_BYTES) / GS_PAGE_BYTES;
+    hi = (dbp + (last + 1u) * GS_PAGE_BYTES - 1u) / GS_PAGE_BYTES;
+    if (hi >= GS_VRAM_PAGES) return 0;
+    for (p = lo; p <= hi; p++)
+        if (!gs_page_epoch[p] || gs_page_owner[p] != (dbp | 1u)
+            || gs_page_owner_bw[p] != (u16)dbw || gs_page_owner_psm[p] != (u8)dpsm)
+            return 0;
+    return 1;
 }
 
 #define TRXEXT_N 512
@@ -1206,6 +1322,8 @@ typedef struct {
     int chained;
     s32 lru_prev, lru_next;
     int hashed;
+    u64 pix_mark;    /* software-drawn pixel count when it completed */
+    int prev_ok;     /* bytes[] still hold the last complete upload, and VRAM still matches it */
 } uprec;
 static uprec uprecs[UPREC_N];
 static u32 uprec_n;
@@ -1287,6 +1405,14 @@ static void uprec_begin(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y, u32 w, u32 h) 
         if (r->dbp == dbp && r->dbw == dbw && r->dpsm == dpsm && r->x == x && r->y == y
             && r->w == w && r->h == h) { slot = (u32)k; break; }
     }
+    {   int ok = 0;
+        if (slot != UPREC_N) {
+            uprec *r = &uprecs[slot];
+            ok = r->valid && !r->lost && r->pos >= r->need && r->bytes
+                 && r->pix_mark == gs_stat_pixels;
+        }
+        if (slot != UPREC_N) uprecs[slot].prev_ok = ok;
+    }
     if (slot == UPREC_N) {
         if (uprec_n < UPREC_N) {
             slot = uprec_n++;
@@ -1297,18 +1423,26 @@ static void uprec_begin(u32 dbp, u32 dbw, u32 dpsm, u32 x, u32 y, u32 w, u32 h) 
         }
         uprec_unlink(slot);
         uprecs[slot].dbp = dbp;
+        uprecs[slot].prev_ok = 0;
         uprec_link(slot);
     }
     {
         uprec *r = &uprecs[slot];
         u32 need = (u32)(((u64)w * h * bits + 7u) / 8u);
         if (need > r->cap) {
-            u8 *nb = (u8 *)realloc(r->bytes, need);
-            if (!nb) return;
+            /* the old bytes are about to be overwritten: free and allocate
+             * rather than realloc, which copied up to a megabyte per resize */
+            u8 *nb;
+            free(r->bytes);
+            r->bytes = NULL;
+            r->cap = 0;
+            nb = (u8 *)malloc(need);
+            if (!nb) { r->valid = 0; r->need = 0; r->pos = 0; uprec_cur = -1; return; }
             r->bytes = nb;
             r->cap = need;
         }
         r->dbp = dbp; r->dbw = dbw; r->dpsm = dpsm;
+        if (r->need != need) r->prev_ok = 0;
         r->x = x; r->y = y; r->w = w; r->h = h;
         r->need = need;
         r->pos = 0;
@@ -1333,20 +1467,36 @@ static void uprec_feed(u64 qw) {
     r->pos += n;
 }
 
+static void uprec_finish_inner(void);
 static void uprec_finish(void) {
+    extern volatile u8 ps2_gs_ph;
+    u8 sv = ps2_gs_ph;
+    ps2_gs_ph = 42;
+    uprec_finish_inner();
+    ps2_gs_ph = sv;
+}
+static void uprec_finish_inner(void) {
     uprec *r = &uprecs[uprec_cur];
     uprec_cur = -1;
     blk_marking = 0xFFFFFFFFu;
     if (r->pos < r->need) return;
     r->hashed = 0;
+    r->pix_mark = gs_stat_pixels;
     r->epoch = gs_epoch_seq;
     r->valid = 1;
 }
 
 static u32 uprec_hash(uprec *r) {
     if (!r->hashed) {
-        u32 h = 2166136261u;
-        for (u32 i = 0; i < r->need; i++) h = (h ^ r->bytes[i]) * 16777619u;
+        u32 h = 2166136261u, i = 0;
+        /* word at a time (the value only ever names records within a run) */
+        for (; i + 4u <= r->need; i += 4u) {
+            u32 w;
+            memcpy(&w, r->bytes + i, 4);
+            h = (h ^ w) * 16777619u;
+            h ^= h >> 15;
+        }
+        for (; i < r->need; i++) h = (h ^ r->bytes[i]) * 16777619u;
         r->hash = h;
         r->hashed = 1;
     }
@@ -1376,7 +1526,9 @@ static uprec *uprec_find(u32 dbp, u32 dbw, u32 dpsm, u32 need_w, u32 need_h) {
 
 static void trx_begin(void) {
     u64 pos = gs_reg[GS_TRXPOS], rg = gs_reg[GS_TRXREG];
+    {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 26; }
     u64 bbc = gs_reg[GS_BITBLTBUF];
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 55; }
     uprec_begin((u32)((bbc >> 32) & 0x3FFFull) * 256u, (u32)((bbc >> 48) & 0x3Full) * 64u,
                 (u32)((bbc >> 56) & 0x3Full), (u32)((pos >> 32) & 0x7FFull),
                 (u32)((pos >> 48) & 0x7FFull), (u32)(rg & 0xFFFull),
@@ -1384,11 +1536,25 @@ static void trx_begin(void) {
     trx_sum = 2166136261u;
     trx_geom_sync();
     gs_vram_epoch++;
-    gs_dirty_rect((u32)((bbc >> 32) & 0x3FFFull) * 256u,
-                  (u32)((bbc >> 48) & 0x3Full) * 64u,
-                  (u32)((bbc >> 56) & 0x3Full),
-                  (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull),
-                  (u32)(rg & 0xFFFull), (u32)((rg >> 32) & 0xFFFull));
+    if (trx_dirty_pending && !trx_changed) ps2_gs_trx_unchanged++;
+    trx_dirty_pending = 0;
+    trx_pend[0] = (u32)((bbc >> 32) & 0x3FFFull) * 256u;
+    trx_pend[1] = (u32)((bbc >> 48) & 0x3Full) * 64u;
+    trx_pend[2] = (u32)((bbc >> 56) & 0x3Full);
+    trx_pend[3] = (u32)((pos >> 32) & 0x7FFull);
+    trx_pend[4] = (u32)((pos >> 48) & 0x7FFull);
+    trx_pend[5] = (u32)(rg & 0xFFFull);
+    trx_pend[6] = (u32)((rg >> 32) & 0xFFFull);
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 56; }
+    if (trx_reupload(trx_pend[0], trx_pend[1], trx_pend[2], trx_pend[3],
+                     trx_pend[4], trx_pend[5], trx_pend[6])) {
+        trx_dirty_pending = 1;
+        trx_changed = 0;
+    } else {
+        trx_changed = 1;
+        gs_dirty_rect(trx_pend[0], trx_pend[1], trx_pend[2], trx_pend[3],
+                      trx_pend[4], trx_pend[5], trx_pend[6]);
+    }
     gs_stat_trx++;
     trx_ext_note((u32)((bbc >> 32) & 0x3FFFull) * 256u,
                  (u32)((pos >> 32) & 0x7FFull), (u32)((pos >> 48) & 0x7FFull),
@@ -1548,6 +1714,11 @@ static void trx_data_inner(u64 qw) {
                 if (base <= GS_VRAM_SIZE - 256u) {
                     u8 *block = gs_vram + base;
                     u64 packed = qw >> (i * 8u);
+                    if (PS2_UNLIKELY(trx_dirty_pending)) {
+                        u64 q = packed;
+                        for (k = 0; k < run; k++, q >>= 8)
+                            if (block[off_row[xb + k] >> 3] != (u8)q) { trx_touch(); break; }
+                    }
                     for (k = 0; k < run; k++) {
                         block[off_row[xb + k] >> 3] = (u8)packed;
                         packed >>= 8;
@@ -1576,7 +1747,11 @@ static void trx_data_inner(u64 qw) {
         trx_log[sl].h = (u32)((rgp >> 32) & 0xFFFull);
         trx_log[sl].sum = trx_sum;
     }
-    if (wrote && !trx_left)
+    if (wrote && !trx_left && !trx_changed) {
+        ps2_gs_trx_unchanged++;
+        trx_dirty_pending = 0;
+        trx_unchanged_done();
+    } else if (wrote && !trx_left)
         gs_dirty_rect(dbp, dbw, dpsm,
                       (u32)((gs_reg[GS_TRXPOS] >> 32) & 0x7FFull),
                       (u32)((gs_reg[GS_TRXPOS] >> 48) & 0x7FFull),
@@ -1596,6 +1771,7 @@ static u32 clut_entry(u32 idx) {
 int ps2_gs_decode_indexed(u32 tbp, u32 tbw, u32 psm, u32 w, u32 h, u32 cbp,
                           u32 cpsm, u8 *rgba) {
     u32 bw = tbw ? tbw * 64u : 64u;
+    if (PS2_GSQ_DEFER()) ps2_gsq_sync("decode_indexed");
     if (psm != PSM_T8 && psm != PSM_T4 && psm != PSM_T8H && psm != PSM_T4HL
         && psm != PSM_T4HH)
         return -1;
@@ -1902,9 +2078,15 @@ static int tex_nocache(void) {
     return nocache;
 }
 
+/* The entry texcache_find last turned down because its pages were written
+ * since: if the raw-page check then finds the same picture, the entry is
+ * brought up to date instead of being turned down again on every draw. */
+static int tc_stale = -1;
+u64 ps2_gs_tc_refreshed;
 static int texcache_find(u64 t0, u64 clut, u32 lod, u32 *idx,
                          float *out_w, float *out_h) {
     u32 bucket = texcache_bucket(t0, clut, lod);
+    tc_stale = -1;
     u32 i, cursor = 0, cand = (u32)texidx[bucket];
     for (i = 0; ; i++) {
         u32 e, s;
@@ -1925,7 +2107,7 @@ static int texcache_find(u64 t0, u64 clut, u32 lod, u32 *idx,
                              texcache[s].tlo, texcache[s].thi);
             { u32 c = gs_range_epoch(texcache[s].clo, texcache[s].chi);
               if (c > e) e = c; }
-            if (e > texcache[s].epoch) continue;
+            if (e > texcache[s].epoch) { tc_stale = (int)s; continue; }
             texcache[s].checked_seq = gs_validation_seq;
         }
         if (texcache[s].index != 0xFFFFFFFFu
@@ -1985,11 +2167,25 @@ static void tex_extent(u64 t0, u32 lod, u32 *tbp_io, u32 *tbw_io, u32 *tw_io,
 }
 
 static u32 current_texture_inner(float *out_w, float *out_h);
+u64 ps2_gs_tex_us, ps2_gs_tex_n;
 static u32 current_texture(float *out_w, float *out_h) {
     u32 r;
+#ifdef PS2_VITA
+    extern int ac5_prof;
+    u64 t0 = ac5_prof ? sceKernelGetProcessTimeWide() : 0;
+#endif
     PS2_PHASE_BEGIN(PS2_PH_TEX);
-    r = current_texture_inner(out_w, out_h);
+    {   extern volatile u8 ps2_gs_ph;
+        u8 sv = ps2_gs_ph;
+        ps2_gs_ph = 20;
+        r = current_texture_inner(out_w, out_h);
+        ps2_gs_ph = sv;
+    }
     PS2_PHASE_END(PS2_PH_TEX);
+#ifdef PS2_VITA
+    if (ac5_prof) ps2_gs_tex_us += sceKernelGetProcessTimeWide() - t0;
+    ps2_gs_tex_n++;
+#endif
     return r;
 }
 
@@ -2009,7 +2205,279 @@ static int texture_peek(float *out_w, float *out_h, u32 *idx, u32 *dw, u32 *dh) 
     *dh = th;
     return 0;
 }
+/* Second-chance texture cache keyed on the raw VRAM bytes. The main cache
+ * drops an entry as soon as anything writes to its pages -- including a
+ * game re-uploading the very same image every frame (AC5's menus do), which
+ * then costs a full decode each time. Hashing the raw pages (and palette) is
+ * several times cheaper than decoding; when they are unchanged the
+ * previously decoded texture is reused. */
+/* 4096 entries in sets of 4, indexed by the raw content too: a slot that
+ * cycles through many small textures (HUD, fonts, effects) kept missing a
+ * 256-entry table keyed by TEX0 alone and decoded ~2000 textures a second */
+#define RAWC_N 4096
+#define RAWC_WAYS 4
+typedef struct { u64 t0, clut, key; u32 lod, raw, hash, idx, tw, th; int used; } rawc_entry;
+static rawc_entry rawc[RAWC_N];
+static u8 rawc_rr[RAWC_N / RAWC_WAYS];
+static rawc_entry *rawc_pick(u64 t0, u64 clut, u32 lod, u32 raw, u32 tw, u32 th) {
+    u32 set = (u32)((((t0 ^ clut ^ lod) * 0x9E3779B97F4A7C15ull) ^ ((u64)raw * 0xBF58476D1CE4E5B9ull)) >> 52)
+            % (RAWC_N / RAWC_WAYS);
+    rawc_entry *e = &rawc[set * RAWC_WAYS];
+    for (u32 w = 0; w < RAWC_WAYS; w++)
+        if (e[w].used && e[w].t0 == t0 && e[w].clut == clut && e[w].lod == lod
+            && e[w].raw == raw && e[w].tw == tw && e[w].th == th)
+            return &e[w];
+    for (u32 w = 0; w < RAWC_WAYS; w++)
+        if (!e[w].used) return &e[w];
+    return &e[rawc_rr[set]++ % RAWC_WAYS];
+}
+u64 ps2_gs_rawc_hits, ps2_gs_rawc_misses, ps2_gs_rawc_bytes;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+static u32 raw_pages_hash(const u8 *p, u32 n, u32 h) {
+    u32 a = h, b = 0x9E3779B9u, c = 0x85EBCA6Bu, d = 0xC2B2AE35u, i = 0;
+    ps2_gs_rawc_bytes += n;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    /* eight lanes on NEON (build 90): the same per-lane step, about twice
+     * the speed of the scalar loop (307 MB/s in build 88) */
+    if (n >= 64u) {
+        const u32 k0[4] = { h, 0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u };
+        const u32 k1[4] = { 0x27D4EB2Fu, 0x165667B1u, 0xD3A2646Cu, 0xFD7046C5u ^ h };
+        uint32x4_t va = vld1q_u32(k0), vb = vld1q_u32(k1);
+        const uint32x4_t m = vdupq_n_u32(0x01000193u);
+        u32 la[4], lb[4];
+        for (; i + 32u <= n; i += 32u) {
+            uint32x4_t w0 = vreinterpretq_u32_u8(vld1q_u8(p + i));
+            uint32x4_t w1 = vreinterpretq_u32_u8(vld1q_u8(p + i + 16u));
+            va = vmulq_u32(veorq_u32(va, w0), m);
+            vb = vmulq_u32(veorq_u32(vb, w1), m);
+        }
+        vst1q_u32(la, va); vst1q_u32(lb, vb);
+        a = la[0] ^ (lb[0] * 11u); b = la[1] ^ (lb[1] * 13u);
+        c = la[2] ^ (lb[2] * 17u); d = la[3] ^ (lb[3] * 19u);
+    }
+#endif
+    for (; i + 16u <= n; i += 16u) {
+        u32 w0, w1, w2, w3;
+        memcpy(&w0, p + i, 4); memcpy(&w1, p + i + 4, 4);
+        memcpy(&w2, p + i + 8, 4); memcpy(&w3, p + i + 12, 4);
+        a = (a ^ w0) * 0x01000193u; b = (b ^ w1) * 0x01000193u;
+        c = (c ^ w2) * 0x01000193u; d = (d ^ w3) * 0x01000193u;
+    }
+    for (; i < n; i++) a = (a ^ p[i]) * 0x01000193u;
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u) ^ n;
+}
+
+#define GS_PALC_N 16u
+static struct { u64 key; u32 n, epoch, hash, vseq; int used; u32 pal[256]; } palc[GS_PALC_N];
+static u32 palc_next;
+static u32 gs_epoch_seq_clut_ok = 1;   /* bumped to drop every cached palette */
+u64 gs_palc_hits, gs_palc_misses;
+/* Per-page hashes of VRAM, recomputed only when a page's epoch moves.
+ * Recognising a re-uploaded texture used to hash its whole span on every
+ * texture-cache miss -- several MB a field in a mission. */
+static u32 pg_hash[GS_VRAM_PAGES], pg_hash_ep[GS_VRAM_PAGES];
+static u32 vram_pages_hash(u32 lo, u32 span, u32 seed) {
+    u32 p0 = lo / GS_PAGE_BYTES, p1 = (lo + span - 1u) / GS_PAGE_BYTES, p, h = seed;
+    if (p1 >= GS_VRAM_PAGES) p1 = GS_VRAM_PAGES - 1u;
+    for (p = p0; p <= p1; p++) {
+        if (pg_hash_ep[p] != gs_page_epoch[p] + 1u) {
+            pg_hash[p] = raw_pages_hash(gs_vram + (size_t)p * GS_PAGE_BYTES, GS_PAGE_BYTES, p);
+            pg_hash_ep[p] = gs_page_epoch[p] + 1u;
+        }
+        h = (h ^ pg_hash[p]) * 0x01000193u;
+    }
+    return h ^ (lo * 2654435761u) ^ span;
+}
+
+/* Decoding a large indexed texture (a streamed terrain tile is 512x512, ~7 ms)
+ * on the graphics thread stalled whole fields. The raw pages and palette are
+ * copied (a few hundred KB, well under a millisecond) and the renderer side
+ * decodes them on another core before the frame that uses them is drawn
+ * (ps2_vk_texture_async). AC5_TEX_ASYNC=0 decodes here as before. */
+typedef struct { u32 tbp, span, tbw, psm, tw, th, p8; gs_geom g; u32 pal[256]; u8 bytes[]; } tex_job;
+/* Paletted output (build 91): the job writes the texture as 8-bit indices
+ * plus its palette, behind a 16-byte marker, and the renderer hands that to
+ * the GPU as a P8 texture: a quarter of the bytes to write and upload, and
+ * no per-texel palette lookup on the CPU. AC5_TEX_P8=0 writes RGBA. */
+const u32 ps2_tex_p8_magic[4] = { 0x50385458u, 0x8A3C5E71u, 0x1D2B7F09u, 0xC6E1A4B3u };
+static int tex_p8_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("AC5_TEX_P8"); on = !(e && *e == '0'); }
+    return on;
+}
+static void tex_job_fill_p8(const tex_job *j, u8 *out) {
+    const gs_geom *g = &j->g;
+    u32 ppr = j->tbw / g->pw, y;
+    const u8 *src = j->bytes - j->tbp;
+    u8 *ix = out + 16u + 1024u;
+    if (!ppr) ppr = 1;
+    memcpy(out, ps2_tex_p8_magic, 16);
+    memcpy(out + 16, j->pal, 1024);
+    for (y = 0; y < j->th; y++) {
+        u8 *row = ix + (size_t)y * j->tw;
+        const u32 page_row = (y >> g->phsh) * ppr;
+        const u8 *blk_row = g->tab + (size_t)((y & g->phmask) >> g->bhsh) * g->tabcols;
+        const u16 *off_row = g->off + ((y & g->bhmask) << g->bwsh);
+        const u64 row_bit = (u64)j->tbp * 8u + (u64)page_row * 65536u;
+        u32 x = 0;
+        while (x < j->tw) {
+            u64 blkbit = row_bit + (u64)(x >> g->pwsh) * 65536u
+                       + (u64)blk_row[(x & g->pwmask) >> g->bwsh] * 2048u;
+            u32 xb = x & g->bwmask, run = g->bw - xb, k;
+            const u32 base = (u32)(blkbit >> 3);
+            u8 *dst = row + x;
+            const u16 *offsets = off_row + xb;
+            if (run > j->tw - x) run = j->tw - x;
+            if (base >= j->tbp && base + 256u <= j->tbp + j->span) {
+                const u8 *block = src + base;
+                if (j->psm == PSM_T8H || j->psm == PSM_T4HL || j->psm == PSM_T4HH) {
+                    const u32 sh = j->psm == PSM_T4HH ? 4u : 0u;
+                    const u32 m = j->psm == PSM_T8H ? 0xFFu : 0x0Fu;
+                    for (k = 0; k < run; k++)
+                        dst[k] = (u8)((block[(offsets[k] >> 3) + 3u] >> sh) & m);
+                } else if (j->psm == PSM_T8) {
+                    for (k = 0; k + 4u <= run; k += 4u) {
+                        dst[k]      = block[offsets[k] >> 3];
+                        dst[k + 1u] = block[offsets[k + 1u] >> 3];
+                        dst[k + 2u] = block[offsets[k + 2u] >> 3];
+                        dst[k + 3u] = block[offsets[k + 3u] >> 3];
+                    }
+                    for (; k < run; k++) dst[k] = block[offsets[k] >> 3];
+                } else {
+                    for (k = 0; k < run; k++) {
+                        const u32 b = offsets[k];
+                        dst[k] = (u8)((block[b >> 3] >> (b & 4u)) & 15u);
+                    }
+                }
+            } else {
+                for (k = 0; k < run; k++) dst[k] = 0;
+            }
+            x += run;
+        }
+    }
+}
+static void tex_job_fill(void *jp, u8 *out) {
+    const tex_job *j = (const tex_job *)jp;
+    const gs_geom *g = &j->g;
+    u32 ppr = j->tbw / g->pw, y;
+    const u8 *src = j->bytes - j->tbp;      /* indexed by absolute VRAM address */
+    if (j->p8) { tex_job_fill_p8(j, out); return; }
+    if (!ppr) ppr = 1;
+    for (y = 0; y < j->th; y++) {
+        u8 *row = out + (size_t)y * j->tw * 4u;
+        const u32 page_row = (y >> g->phsh) * ppr;
+        const u8 *blk_row = g->tab + (size_t)((y & g->phmask) >> g->bhsh) * g->tabcols;
+        const u16 *off_row = g->off + ((y & g->bhmask) << g->bwsh);
+        const u64 row_bit = (u64)j->tbp * 8u + (u64)page_row * 65536u;
+        u32 x = 0;
+        while (x < j->tw) {
+            u64 blkbit = row_bit + (u64)(x >> g->pwsh) * 65536u
+                       + (u64)blk_row[(x & g->pwmask) >> g->bwsh] * 2048u;
+            u32 xb = x & g->bwmask, run = g->bw - xb, k;
+            const u32 base = (u32)(blkbit >> 3);
+            u32 *dst = (u32 *)(row + x * 4u);
+            const u16 *offsets = off_row + xb;
+            if (run > j->tw - x) run = j->tw - x;
+            if (base >= j->tbp && base + 256u <= j->tbp + j->span) {
+                const u8 *block = src + base;
+                if (j->psm == PSM_CT32) {
+                    /* 32-bit colour (build 105): decoded here too, not on the GS */
+                    for (k = 0; k < run; k++) {
+                        u32 w32, a;
+                        memcpy(&w32, block + (offsets[k] >> 3), 4);
+                        a = (w32 >> 24) & 0xFFu;
+                        a = a >= 128u ? 255u : a * 2u;
+                        dst[k] = (w32 & 0x00FFFFFFu) | (a << 24);
+                    }
+                } else if (j->psm == PSM_T8H || j->psm == PSM_T4HL || j->psm == PSM_T4HH) {
+                    /* index in the top byte (or nibble) of a 32-bit pixel */
+                    const u32 sh = j->psm == PSM_T4HH ? 4u : 0u;
+                    const u32 m = j->psm == PSM_T8H ? 0xFFu : 0x0Fu;
+                    for (k = 0; k < run; k++)
+                        dst[k] = j->pal[(block[(offsets[k] >> 3) + 3u] >> sh) & m];
+                } else if (j->psm == PSM_T8) {
+                    for (k = 0; k + 4u <= run; k += 4u) {
+                        dst[k]      = j->pal[block[offsets[k] >> 3]];
+                        dst[k + 1u] = j->pal[block[offsets[k + 1u] >> 3]];
+                        dst[k + 2u] = j->pal[block[offsets[k + 2u] >> 3]];
+                        dst[k + 3u] = j->pal[block[offsets[k + 3u] >> 3]];
+                    }
+                    for (; k < run; k++) dst[k] = j->pal[block[offsets[k] >> 3]];
+                } else {
+                    for (k = 0; k < run; k++) {
+                        const u32 b = offsets[k];
+                        dst[k] = j->pal[(block[b >> 3] >> (b & 4u)) & 15u];
+                    }
+                }
+            } else {
+                for (k = 0; k < run; k++) dst[k] = j->pal[0];
+            }
+            x += run;
+        }
+    }
+}
+u64 ps2_gs_tex_async_n, ps2_gs_dec_psm[64];
+/* renderers without a decode helper refuse, and the texture is decoded here */
+__attribute__((weak)) u32 ps2_vk_texture_async(u64 key, u32 hash, u32 w, u32 h,
+                                               void (*fill)(void *job, u8 *rgba), void *job) {
+    (void)key; (void)hash; (void)w; (void)h; (void)fill; (void)job;
+    return 0xFFFFFFFFu;
+}
+
+/* Textures recognised by the uploads that put them in VRAM. Mission
+ * terrain streams its tiles through a few shared texture slots, so the
+ * page-content check below hashed tens of KB per draw (~100 ms in a busy
+ * field). The upload records already know what each upload wrote and
+ * whether VRAM still holds it, so the tile is named by those records: a
+ * few lookups, no hashing. Falls back to the page check when the records
+ * do not cover the texture. AC5_TEX_UPID=0 turns it off. */
+static int tex_upload_identity(u32 tw, u32 th, u32 *h);
+#define UPC_N 2048
+typedef struct { u64 t0, clut, key; u32 lod, uh, tw, th, idx, hash; int used; } upc_entry;
+static upc_entry upc[UPC_N];
+u64 ps2_gs_upc_hits, ps2_gs_upc_misses, ps2_gs_upc_none;
+/* TEX0 without its two addresses (TBP0, CBP): the upload names are by
+ * content, so a tile streamed into another VRAM slot is the same texture. */
+/* Off by default since build 74: with it on, ground tiles switched to the
+ * wrong texture (build 73). AC5_TEX_ANYSLOT=1 turns it back on. */
+static int upid_anyslot(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("AC5_TEX_ANYSLOT"); on = e && *e == '1'; }
+    return on;
+}
+static inline u64 tex0_noaddr(u64 t0) {
+    return upid_anyslot() ? t0 & ~(0x3FFFull | (0x3FFFull << 37)) : t0;
+}
+static upc_entry *upc_slot(u64 t0, u64 clut, u32 lod, u32 uh) {
+    u64 k = (tex0_noaddr(t0) ^ clut * 0x9E3779B97F4A7C15ull ^ lod) * 0xBF58476D1CE4E5B9ull ^ uh;
+    return &upc[(u32)(k >> 32) % UPC_N];
+}
+int upc_mode(void);
+static int upc_on(void) { return upc_mode() != 0; }
+int upc_mode(void) {
+    static int on = -1;
+    /* 0 off, 1 (default) both routes, 2 only a texture's own upload */
+    /* default off since build 83: it made ground textures switch, and with
+     * the bigger raw cache it no longer bought any speed */
+    if (on < 0) { const char *e = getenv("AC5_TEX_UPID"); on = e && *e >= '0' && *e <= '2' ? *e - '0' : 0; }
+    return on;
+}
+
+/* split of the texture lookup's time (Vita): cache probe, upload naming,
+ * page hashing, decoding; and how lookups ended */
+u64 ps2_tl_us[4], ps2_tl_end[5];
+#ifdef PS2_VITA
+extern int ac5_prof;
+#define TL_NOW() (ac5_prof ? sceKernelGetProcessTimeWide() : 0ull)
+#else
+#define TL_NOW() 0ull
+#endif
 static u32 current_texture_inner(float *out_w, float *out_h) {
+    u32 async_idx = 0xFFFFFFFFu;
+    u64 tl0 = TL_NOW(), tl1;
     u64 t0 = tex0_reg();
     u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
     u32 tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
@@ -2018,14 +2486,37 @@ static u32 current_texture_inner(float *out_w, float *out_h) {
     u32 th = 1u << ((t0 >> 30) & 0xFull);
     u32 lod = gs_tex_lod();
     u32 need, hash = 2166136261u, y, x;
+    u32 rawh = 0; int have_raw = 0; rawc_entry *rce = NULL;
     u64 key, clut = gs_reg[GS_TEXCLUT];
     if (!gs_vram) return 0xFFFFFFFFu;
     if (!tex_nocache()) {
         u32 idx;
-        if (texcache_find(t0, clut, lod, &idx, out_w, out_h)) return idx;
+        if (texcache_find(t0, clut, lod, &idx, out_w, out_h)) {
+            ps2_tl_us[0] += TL_NOW() - tl0; ps2_tl_end[0]++;
+            return idx;
+        }
     }
+    tl1 = TL_NOW(); ps2_tl_us[0] += tl1 - tl0; tl0 = tl1;
+    {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 21; }
     texcache_misses++;
     tex_extent(t0, lod, &tbp, &tbw, &tw, &th, out_w, out_h);
+    u32 upid = 0; int have_upid = 0; upc_entry *ue = NULL;
+    if (upc_on() && !tex_nocache()) {
+        if (tex_upload_identity(tw, th, &upid)) {
+            have_upid = 1;
+            ue = upc_slot(t0, clut, lod, upid);
+            if (ue->used && ue->t0 == tex0_noaddr(t0) && ue->clut == clut && ue->lod == lod && ue->uh == upid
+                && ue->tw == tw && ue->th == th && ps2_vk_texture_is(ue->idx, ue->key, ue->hash)) {
+                ps2_gs_upc_hits++;
+                ps2_tl_us[1] += TL_NOW() - tl0; ps2_tl_end[1]++;
+                return ue->idx;
+            }
+            ps2_gs_upc_misses++;
+        } else {
+            ps2_gs_upc_none++;
+        }
+    }
+    tl1 = TL_NOW(); ps2_tl_us[1] += tl1 - tl0; tl0 = tl1;
     texovl_note(tbp, psm, tbw, tw, th);
     need = tw * th * 4u;
     if (need > tex_scratch_cap) {
@@ -2040,27 +2531,154 @@ static u32 current_texture_inner(float *out_w, float *out_h) {
                             || psm == PSM_T4HL || psm == PSM_T4HH);
         u32 pal[256];
         gs_psm_geom(psm, &g);
+        if (!indexed) memset(pal, 0, sizeof pal);   /* the async job and its hash read it */
         ppr = tbw / g.pw;
         if (!ppr) ppr = 1;
         if (indexed) {
             u32 n = (psm == PSM_T4 || psm == PSM_T4HL || psm == PSM_T4HH)
                     ? 16u : 256u;
             u32 e;
-            for (e = 0; e < n; e++) {
-                u32 c = clut_entry(e);
-                u32 a = (c >> 24) & 0xFFu;
-                a = a >= 128u ? 255u : a * 2u;
-                pal[e] = (c & 0x00FFFFFFu) | (a << 24);
+            /* Palettes repeat across many textures and fields; working one
+             * out reads every entry through the VRAM swizzle. Keep the last
+             * few, keyed by the CLUT fields of TEX0 and the epoch of the
+             * pages the CLUT sits in (CSM1 only: CSM2 reads at TEXCLUT
+             * offsets anywhere and is always worked out). */
+            const u64 ckey = t0 >> 37;
+            const int csm2 = (int)((t0 >> 55) & 1ull);
+            const u32 cpg = (u32)((t0 >> 37) & 0x3FFFull) * 256u / GS_PAGE_BYTES;
+            u32 cep = 0;
+            int pc = -1;
+            if (!csm2 && cpg + 1u < GS_VRAM_PAGES) {
+                cep = gs_page_epoch[cpg] > gs_page_epoch[cpg + 1u]
+                    ? gs_page_epoch[cpg] : gs_page_epoch[cpg + 1u];
+                for (e = 0; e < GS_PALC_N; e++)
+                    if (palc[e].used && palc[e].key == ckey && palc[e].n == n
+                        && palc[e].epoch == cep && palc[e].vseq == gs_epoch_seq_clut_ok) {
+                        pc = (int)e;
+                        break;
+                    }
             }
-            for (e = 0; e < (psm == PSM_T4 || psm == PSM_T4HL
-                             || psm == PSM_T4HH ? 16u : 256u); e++)
-                hash = (hash ^ pal[e]) * 16777619u;
-            for (; n < 256u; n++) pal[n] = pal[n & 15u];
+            if (pc >= 0) {
+                memcpy(pal, palc[pc].pal, sizeof pal);
+                hash = palc[pc].hash;
+                gs_palc_hits++;
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 27; }
+            } else {
+                for (e = 0; e < n; e++) {
+                    u32 c = clut_entry(e);
+                    u32 a = (c >> 24) & 0xFFu;
+                    a = a >= 128u ? 255u : a * 2u;
+                    pal[e] = (c & 0x00FFFFFFu) | (a << 24);
+                }
+                for (e = 0; e < n; e++)
+                    hash = (hash ^ pal[e]) * 16777619u;
+                for (e = n; e < 256u; e++) pal[e] = pal[e & 15u];
+                if (!csm2 && cpg + 1u < GS_VRAM_PAGES) {
+                    u32 k = palc_next++ % GS_PALC_N;
+                    palc[k].used = 1;
+                    palc[k].key = ckey;
+                    palc[k].n = n;
+                    palc[k].epoch = cep;
+                    palc[k].vseq = gs_epoch_seq_clut_ok;
+                    palc[k].hash = hash;
+                    memcpy(palc[k].pal, pal, sizeof pal);
+                }
+                gs_palc_misses++;
+            }
         }
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 28; }
         texcache_texels += (u64)tw * th;
         const int redirect = gs_shadow_build(
             tbp, tbw, tbp,
             tbp + gs_page_span(&g, tbw, tw - 1u, th - 1u) * GS_PAGE_BYTES);
+        if (!redirect) {
+            u32 span = gs_page_span(&g, tbw, tw - 1u, th - 1u) * GS_PAGE_BYTES;
+            if (tbp < GS_VRAM_SIZE) {
+                if (span > GS_VRAM_SIZE - tbp) span = GS_VRAM_SIZE - tbp;
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 29; }
+                rawh = vram_pages_hash(tbp, span, (u32)(t0 ^ (t0 >> 32)) ^ tw * 31u ^ th);
+                if (indexed) rawh = raw_pages_hash((const u8 *)pal, sizeof pal, rawh);
+                have_raw = 1;
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 30; }
+                rce = rawc_pick(t0, clut, lod, rawh, tw, th);
+                if (rce->used && rce->t0 == t0 && rce->clut == clut && rce->lod == lod
+                    && rce->raw == rawh && rce->tw == tw && rce->th == th
+                    && ps2_vk_texture_is(rce->idx, rce->key, rce->hash)) {
+                    ps2_gs_rawc_hits++;
+                    if (tc_stale >= 0) {
+                        u32 sl = (u32)tc_stale;
+                        if (texcache[sl].used && texcache[sl].t0 == t0 && texcache[sl].clut == clut
+                            && texcache[sl].lod == lod && texcache[sl].index == rce->idx) {
+                            u32 e = gs_content_epoch(texcache[sl].tlo, texcache[sl].tbw,
+                                                     texcache[sl].tlo, texcache[sl].thi);
+                            u32 c = gs_range_epoch(texcache[sl].clo, texcache[sl].chi);
+                            texcache[sl].epoch = c > e ? c : e;
+                            texcache[sl].checked_seq = gs_validation_seq;
+                            texidx[texcache_bucket(t0, clut, lod)] = (u16)(sl + 1u);
+                            ps2_gs_tc_refreshed++;
+                        }
+                        tc_stale = -1;
+                    }
+                    if (have_upid && ue) {
+                        ue->used = 1; ue->t0 = tex0_noaddr(t0); ue->clut = clut; ue->lod = lod; ue->uh = upid;
+                        ue->tw = tw; ue->th = th; ue->idx = rce->idx; ue->key = rce->key; ue->hash = rce->hash;
+                    }
+                    ps2_tl_us[2] += TL_NOW() - tl0; ps2_tl_end[2]++;
+                    return rce->idx;
+                }
+                ps2_gs_rawc_misses++;
+            }
+        }
+        tl1 = TL_NOW(); ps2_tl_us[2] += tl1 - tl0; tl0 = tl1;
+        {   static int async_on = -1;
+            if (async_on < 0) { const char *e = getenv("AC5_TEX_ASYNC"); async_on = !(e && *e == '0'); }
+            static int async32 = -1;
+            if (async32 < 0) { const char *e = getenv("AC5_TEX_ASYNC32"); async32 = e && *e == '1'; }   /* off: build 105 felt much slower */
+            if (async_on && (redirect || have_raw)
+                && (psm == PSM_T8 || psm == PSM_T4 || psm == PSM_T8H || psm == PSM_T4HL || psm == PSM_T4HH
+                    || (async32 && psm == PSM_CT32))
+                && tw * th >= 32u * 32u && tbp < GS_VRAM_SIZE) {
+                u32 span = gs_page_span(&g, tbw, tw - 1u, th - 1u) * GS_PAGE_BYTES;
+                tex_job *j;
+                if (span > GS_VRAM_SIZE - tbp) span = GS_VRAM_SIZE - tbp;
+                {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 22; }
+                j = (tex_job *)malloc(sizeof *j + span);
+                if (j) {
+                    j->tbp = tbp; j->span = span; j->tbw = tbw; j->psm = psm;
+                    j->tw = tw; j->th = th; j->g = g;
+                    j->p8 = psm != PSM_CT32 && tex_p8_on() && tw >= 8u && !(tw & 7u);
+                    memcpy(j->pal, pal, sizeof j->pal);
+                    if (!redirect) {
+                        memcpy(j->bytes, gs_vram + tbp, span);
+                        hash = rawh ^ 0xA5C3E1F7u;
+                    } else {
+                        /* pages the game has since reused are read from their
+                         * shadow copies (gs_shadow_build), as the decode below would */
+                        u32 a = tbp, end = tbp + span;
+                        while (a < end) {
+                            u32 pg = a / GS_PAGE_BYTES, nx = (pg + 1u) * GS_PAGE_BYTES;
+                            const u8 *ps = pg < GS_VRAM_PAGES ? gs_pagebase[pg] : gs_vram;
+                            if (nx > end) nx = end;
+                            memcpy(j->bytes + (a - tbp), ps + a, nx - a);
+                            a = nx;
+                        }
+                        hash = raw_pages_hash(j->bytes, span, (u32)(t0 ^ (t0 >> 32)) ^ tw * 31u ^ th);
+                        hash = raw_pages_hash((const u8 *)pal, sizeof pal, hash) ^ 0x5A3C96E1u;
+                    }
+                    key = ((u64)tbp << 32) | ((u64)psm << 24) | ((u64)tw << 12) | th;
+                    if (j->p8) hash ^= 0x38503850u;
+                    {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 24; }
+                    async_idx = ps2_vk_texture_async(key, hash, tw, th, tex_job_fill, j);
+                    if (async_idx != 0xFFFFFFFFu) {
+                        ps2_gs_tex_async_n++;
+                        goto tex_store;
+                    }
+                    free(j);
+                }
+            }
+        }
+        ps2_gs_dec_psm[psm & 63u]++;
+        {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 23; }
         for (y = 0; y < th; y++) {
             u8 *row = tex_scratch + (size_t)y * tw * 4u;
             const u32 page_row = (y >> g.phsh) * ppr;
@@ -2337,8 +2955,19 @@ static u32 current_texture_inner(float *out_w, float *out_h) {
             }
         }
     }
+tex_store:;
     {
-        u32 idx = ps2_vk_texture(key, hash, tex_scratch, tw, th);
+        u32 idx = async_idx != 0xFFFFFFFFu ? async_idx : ps2_vk_texture(key, hash, tex_scratch, tw, th);
+        ps2_tl_us[3] += TL_NOW() - tl0; ps2_tl_end[3]++;
+        if (have_upid && ue && idx != 0xFFFFFFFFu) {
+            ue->used = 1; ue->t0 = tex0_noaddr(t0); ue->clut = clut; ue->lod = lod; ue->uh = upid;
+            ue->tw = tw; ue->th = th; ue->idx = idx; ue->key = key; ue->hash = hash;
+        }
+        if (have_raw && rce && idx != 0xFFFFFFFFu) {
+            rce->used = 1; rce->t0 = t0; rce->clut = clut; rce->lod = lod;
+            rce->raw = rawh; rce->tw = tw; rce->th = th;
+            rce->key = key; rce->hash = hash; rce->idx = idx;
+        }
         u32 slot = texcache_next++ % TEXCACHE_N;
         gs_geom g;
         u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
@@ -2599,6 +3228,8 @@ void ps2_gs_cap_load(const ps2_gs_capstate *st) {
     gs_rt_n = st->rt_n < GS_RT_SLOTS ? st->rt_n : GS_RT_SLOTS;
     gs_disp_base = st->disp_base;
     gs_epoch_seq = st->epoch_seq;
+    gs_epoch_seq_clut_ok++;
+    memset(pg_hash_ep, 0, sizeof pg_hash_ep);
     ++gs_validation_seq;
     memset(texcache, 0, sizeof texcache);
     memset(texmembers, 0, sizeof texmembers);
@@ -3490,6 +4121,16 @@ typedef struct {
     int four, indexed;
 } uprec_sel;
 
+/* How much of the CLUT area at CBP a lookup must have covered so the palette
+ * CSA selects is inside it: an 8x2 palette at CSA 0 is the first 8x2, but at
+ * CSA 5 it sits further in, and naming the texture by the first one gave the
+ * ground the wrong palette (the switching textures of builds 68-75). */
+static void clut_extent(u64 t0, int four, u32 cpsm, u32 *w, u32 *h) {
+    u32 csa = (u32)((t0 >> 56) & 0x1Full);
+    if (!four) { *w = 16u; *h = 16u; return; }
+    if (cpsm == PSM_CT32) { *w = 16u; *h = ((csa & 15u) >> 1) * 2u + 2u; return; }
+    *w = 16u; *h = 32u;
+}
 static int uprec_pick(u32 x0, u32 y0, u32 w, u32 h, uprec_sel *p, u32 *hash_out) {
     u64 t0 = tex0_reg();
     u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
@@ -3536,7 +4177,8 @@ static int uprec_pick(u32 x0, u32 y0, u32 w, u32 h, uprec_sel *p, u32 *hash_out)
     }
     hash = uprec_hash(r) ^ (x0 * 73856093u) ^ (y0 * 19349663u) ^ (w * 83492791u) ^ h;
     if (indexed) {
-        u32 pw = four ? 8u : 16u, ph = four ? 2u : 16u;
+        u32 pw, ph;
+        clut_extent(t0, four, cpsm, &pw, &ph);
         if (cpsm != PSM_CT32 && cpsm != PSM_CT16 && cpsm != PSM_CT16S) {
             st_upfail[UPF_PSM]++;
             return 0;
@@ -3556,6 +4198,72 @@ static int uprec_pick(u32 x0, u32 y0, u32 w, u32 h, uprec_sel *p, u32 *hash_out)
     p->bits = bits; p->psm = psm; p->cpsm = cpsm;
     p->four = four; p->indexed = indexed;
     *hash_out = hash;
+    return 1;
+}
+
+/* Name a texture by the uploads that own the VRAM blocks it reads, whatever
+ * format they were uploaded in (AC5 uploads indexed textures as 32-bit
+ * data). Every block must be owned by a complete, unlost upload whose
+ * rectangle lies on block boundaries, so the block's bytes are exactly that
+ * upload's; the name then combines each owner's content hash and geometry
+ * with the block's position. Blocks drawn into by the GS have no owner. */
+typedef struct { u32 h; u32 n; int bad; u32 base; } blkid_acc;
+static int blkid_cb(u32 blk, void *u) {
+    blkid_acc *a = (blkid_acc *)u;
+    u32 id = blk_owner[blk], sl = blk_slot[blk];
+    uprec *r;
+    gs_geom g;
+    if (!id || id == 0xFFFFFFFFu || sl >= UPREC_N) { a->bad = 1; return 1; }
+    r = &uprecs[sl];
+    if (r->id != id || !r->valid || r->lost || r->pos < r->need || !r->bytes) { a->bad = 1; return 1; }
+    gs_psm_geom(r->dpsm, &g);
+    if ((r->x & g.bwmask) || (r->y & g.bhmask) || (r->w & g.bwmask) || (r->h & g.bhmask)) {
+        a->bad = 1; return 1;
+    }
+    a->h = (a->h ^ uprec_hash(r)) * 16777619u;
+    /* positions relative to the texture (or palette) start, so the same
+     * content in another slot gets the same name */
+    a->h = (a->h ^ ((r->dbp - a->base) + r->dbw * 7u + r->dpsm * 131u + r->x * 1031u
+                    + r->y * 65537u + r->w * 3u + r->h * 11u)) * 16777619u;
+    a->h = (a->h ^ (blk - a->base / 256u)) * 16777619u;
+    a->n++;
+    return 0;
+}
+u64 ps2_gs_upid_pick, ps2_gs_upid_blocks;
+static int tex_upload_identity(u32 tw, u32 th, u32 *h) {
+    uprec_sel sel;
+    u64 t0 = tex0_reg();
+    u32 tbp = (u32)(t0 & 0x3FFFull) * 256u;
+    u32 tbw = (u32)((t0 >> 14) & 0x3Full) * 64u;
+    u32 psm = (u32)((t0 >> 20) & 0x3Full);
+    u32 cbp = (u32)((t0 >> 37) & 0x3FFFull) * 256u;
+    u32 cpsm = (u32)((t0 >> 51) & 0xFull);
+    int indexed = psm == PSM_T8 || psm == PSM_T4 || psm == PSM_T8H
+               || psm == PSM_T4HL || psm == PSM_T4HH;
+    blkid_acc a;
+    /* exact record of this texture, when the game uploaded it as itself */
+    if (uprec_pick(0, 0, tw, th, &sel, h)) { ps2_gs_upid_pick++; return 1; }
+    if (!uprec_heads_ready || !tbw) return 0;
+    if (((t0 >> 55) & 1ull)) return 0;            /* CSM2 palettes: not handled */
+    {   u64 tn = tex0_noaddr(t0);
+        a.h = 2166136261u ^ (u32)tn ^ (u32)(tn >> 32); }
+    {   extern int upc_mode(void);
+        if (upc_mode() == 2) return 0; }
+    a.n = 0; a.bad = 0; a.base = upid_anyslot() ? tbp : 0;
+    blk_walk(tbp, tbw, psm, 0, 0, tw, th, blkid_cb, &a);
+    if (a.bad || !a.n) return 0;
+    if (indexed) {
+        u32 four = psm == PSM_T4 || psm == PSM_T4HL || psm == PSM_T4HH;
+        a.base = upid_anyslot() ? cbp : 0;
+        u32 pw, ph;
+        clut_extent(t0, four, cpsm, &pw, &ph);
+        blk_walk(cbp, 0, cpsm, 0, 0, pw, ph, blkid_cb, &a);
+        if (a.bad) return 0;
+    } else if (psm != PSM_CT32) {
+        a.h = (a.h ^ (u32)(gs_reg[GS_TEXA] ^ (gs_reg[GS_TEXA] >> 32))) * 16777619u;
+    }
+    ps2_gs_upid_blocks++;
+    *h = a.h;
     return 1;
 }
 
@@ -3611,7 +4319,31 @@ static void native_state_decode(ps2_vk_state *st) {
     if (st->tex_index == 0xFFFFFFFFu) st->tme = 0;
 }
 
+static void ps2_gs_native_state_inner(ps2_vk_state *st);
+extern u64 rn_tq_state_us, rn_tq_state_n;
+#ifdef PS2_VITA
+#include <psp2/kernel/processmgr.h>
+#endif
 void ps2_gs_native_state(ps2_vk_state *st) {
+    if (PS2_GSQ_DEFER()) {
+        /* worked out on the GS thread; the draw that follows uses that */
+        memset(st, 0, sizeof *st);
+        st->tex_index = 0xFFFFFFFFu;
+        ps2_gsq_nstate();
+        return;
+    }
+#ifdef PS2_VITA
+    extern int ac5_prof;
+    if (!ac5_prof) { ps2_gs_native_state_inner(st); return; }
+    u64 t0 = sceKernelGetProcessTimeWide();
+    ps2_gs_native_state_inner(st);
+    rn_tq_state_us += sceKernelGetProcessTimeWide() - t0;
+    rn_tq_state_n++;
+#else
+    ps2_gs_native_state_inner(st);
+#endif
+}
+static void ps2_gs_native_state_inner(ps2_vk_state *st) {
     static int sw = -1, verify = -1;
     if (sw < 0) {
         const char *e = getenv("PS2_RN_TEX");
@@ -3687,6 +4419,13 @@ void ps2_gs_native_state(ps2_vk_state *st) {
 }
 
 void ps2_gs_native_frame(float *xoff, float *yoff, float *zmax) {
+    if (PS2_GSQ_DEFER()) {
+        /* filled in on the GS thread when the draw runs */
+        *xoff = *yoff = 0.0f;
+        *zmax = 4294967295.0f;
+        ps2_gsq_mark_frame();
+        return;
+    }
     u64 off = xyoff_reg();
     u32 psm = (u32)((zbuf_reg() >> 24) & 0xFull);
     *xoff = (float)(off & 0xFFFFull) / 16.0f;
@@ -3967,10 +4706,42 @@ int ps2_gs_present_now(void) {
                         slot < 0 ? 0 : slot, slot < 0 ? gs_rt_field[0] : gs_rt_field[slot]);
         }
     }
+    /* Both read circuits on: the PS2 blends circuit 1 over circuit 2 in the
+     * display hardware (the mission briefing's 3D map is drawn this way).
+     * Hand the renderer circuit 1 as an overlay on the picture. */
+    {
+        u64 pm = ps2_gs_priv_read(0x12000000u);
+        int ov = -1;
+        u32 ox = 0, oy = 0;
+        float alpha = -1.0f;
+        if ((pm & 3ull) == 3ull) {
+            u64 fb1 = ps2_gs_priv_read(0x12000070u);
+            u32 base1 = (u32)(fb1 & 0x1FFull) * 2048u * 4u;
+            int s1 = rt_find(base1);
+            if (s1 >= 0 && s1 != slot) {
+                ov = s1;
+                ox = (u32)((fb1 >> 32) & 0x7FFull);
+                oy = (u32)((fb1 >> 43) & 0x7FFull);
+                if (pm & (1ull << 5)) alpha = (float)((pm >> 8) & 0xFFull) / 255.0f;
+            }
+            {   static u32 said;
+                if (said++ < 6u)
+                    ps2_log("gs: both display circuits on (PMODE %llX): circuit 1 base %u -> slot %d over slot %d",
+                            (unsigned long long)pm, base1, s1, slot);
+            }
+        }
+        ps2_vk_present_overlay(ov, ox, oy, alpha);
+    }
     return ps2_vk_present(dbx, dby, dw, dh, slot < 0 ? 0u : (u32)slot);
 }
 
+/* Renderers that do not composite the second display circuit. */
+__attribute__((weak)) void ps2_vk_present_overlay(int rt, u32 x, u32 y, float alpha) {
+    (void)rt; (void)x; (void)y; (void)alpha;
+}
+
 void ps2_gs_write_reg(u32 reg, u64 val) {
+    if (PS2_GSQ_DEFER()) { ps2_gsq_wreg(reg, val); return; }
     if (g_cap_shallow) ps2_cap_reg(reg, val);
     if (PS2_UNLIKELY(rn_dump_on)) rn_dump_gsreg(reg, val);
     gs_stat_regs++;
@@ -4028,7 +4799,12 @@ void ps2_gs_write_reg(u32 reg, u64 val) {
         break;
     case GS_TRXDIR:
         gs_trxdir_hist[val & 3ull]++;
-        if ((val & 3ull) == 0ull) trx_begin();
+        if ((val & 3ull) == 0ull) {
+            extern u64 ps2_gs_trxbeg_us;
+            u64 b0 = TL_NOW();
+            trx_begin();
+            ps2_gs_trxbeg_us += TL_NOW() - b0;
+        }
         else if ((val & 3ull) == 2ull) trx_local();
         break;
     case GS_HWREG:
@@ -4040,6 +4816,7 @@ void ps2_gs_write_reg(u32 reg, u64 val) {
 }
 
 void ps2_gs_hwreg_pair(u64 lo, u64 hi) {
+    if (PS2_GSQ_DEFER()) { ps2_gsq_hwpair(lo, hi); return; }
     if (g_cap_shallow) { ps2_cap_reg(GS_HWREG, lo); ps2_cap_reg(GS_HWREG, hi); }
     gs_stat_regs += 2;
     gs_reg_hist[GS_HWREG] += 2;
@@ -4050,11 +4827,289 @@ void ps2_gs_hwreg_pair(u64 lo, u64 hi) {
     PS2_PHASE_END(PS2_PH_TRX);
 }
 
+/* Bulk host->local transfer of 32-bit pixels: one geometry check for the
+ * whole packet instead of one per 64-bit word, and whole block rows per
+ * VRAM address computation. Only for the plain case: PSMCT32 destination,
+ * no VRAM watch or MPEG trace, no upload recorder, first words captured.
+ * Returns the number of quadwords consumed (0 = not taken). */
+static u64 trx_fast_qw, trx_slow_qw;
+u64 ps2_gs_img_px[4], ps2_gs_img_cmp_px, ps2_gs_img_skip_px;
+static u32 trx_stream_ct32(const u8 *src, u32 qwc) {
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 50; }
+    if (trxc_cur >= 0 && trxc[trxc_cur].got < 4) return 0;
+    if (gs_reg[GS_BITBLTBUF] != trx_bb_seen || gs_reg[GS_TRXREG] != trx_rg_seen
+        || gs_reg[GS_TRXPOS] != trx_pos_seen)
+        trx_geom_sync();
+    const u32 bits = trx_dpsm == PSM_CT32 && trx_npix == 2u && trx_g.bits == 32u ? 32u
+                   : trx_dpsm == PSM_T8 && trx_npix == 8u && trx_g.bits == 8u ? 8u
+                   : trx_dpsm == PSM_T4 && trx_npix == 16u && trx_g.bits == 4u ? 4u
+                   : (trx_dpsm == PSM_CT16 || trx_dpsm == PSM_CT16S) && trx_npix == 4u
+                     && trx_g.bits == 16u ? 16u : 0u;
+    if (!bits) return 0;
+    if (!vram_watch_ready) vram_watch_init();
+    if (vram_watch != 0xFFFFFFFFu || PS2_ENV("PS2_TRACE_MPEG")) return 0;
+    if (!gs_vram || !trx_rrw || !trx_left) return 0;
+    {
+        const u32 dbp = trx_dbp, xend = trx_sax + trx_rrw;
+        const u32 total = qwc * (128u / bits);
+        u32 i = 0;
+        /* Same picture as last time, into VRAM that still holds it: compare
+         * against the recorded copy (a straight memcmp) and skip the
+         * swizzled writes altogether. */
+        if (trx_dirty_pending && !trx_changed && uprec_cur >= 0
+            && uprecs[uprec_cur].prev_ok) {
+            uprec *r = &uprecs[uprec_cur];
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 51; }
+            const u32 pix = total < trx_left ? total : trx_left;
+            const u32 nb = pix * bits / 8u;
+            if (!((pix * bits) & 7u) && r->pos + nb <= r->need
+                && !memcmp(r->bytes + r->pos, src, nb)) {
+                u32 off = (trx_x - trx_sax) + pix;
+                r->pos += nb;
+                trx_y += off / trx_rrw;
+                trx_x = trx_sax + off % trx_rrw;
+                trx_left -= pix;
+                gs_stat_trxpix += pix;
+                ps2_gs_trx_skipped_px += pix;
+                ps2_gs_img_skip_px += pix;
+                if (!trx_left) {
+                    ps2_gs_trx_unchanged++;
+                    trx_unchanged_done();
+                    uprec_finish();
+                }
+                trx_fast_qw += qwc;
+                return qwc;
+            }
+            r->prev_ok = 0;
+        }
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 57; }
+        /* 8-bit uploads a whole band of blocks at a time (build 94): with
+         * block-aligned transfers, a band of bh rows is written block by
+         * block from a byte table, instead of one block row per step with
+         * its address worked out each time (img-write, ~16 ms of a slow
+         * field in build 93). AC5_TRX_BAND=0 turns it off. */
+        if (bits == 8u && !trx_dirty_pending && trx_g.bw == 16u && trx_g.bh == 16u) {
+            static int band = -1;
+            static u8 tb8[256];
+            if (band < 0) {
+                const char *e = getenv("AC5_TRX_BAND");
+                band = !(e && *e == '0');
+                for (u32 q = 0; q < 256u; q++) tb8[q] = (u8)(trx_g.off[q] >> 3);
+            }
+            if (band && trx_rrw && !(trx_rrw & 15u) && !(trx_sax & 15u)) {
+                const u32 bandpx = trx_rrw * 16u;
+                { extern volatile u8 ps2_gs_ph; ps2_gs_ph = 58; }
+                while (trx_x == trx_sax && !(trx_y & 15u) && total - i >= bandpx && trx_left >= bandpx) {
+                    const u8 *srow = src + i;
+                    u32 bx, ok = 1;
+                    for (bx = 0; bx < trx_rrw; bx += 16u) {
+                        const u32 base = (u32)((vram_bit_g(&trx_g, dbp, trx_ppr, trx_sax + bx, trx_y)
+                                                - trx_g.off[0]) >> 3);
+                        if (base > GS_VRAM_SIZE - 256u) { ok = 0; break; }
+                    }
+                    if (!ok) break;
+                    for (bx = 0; bx < trx_rrw; bx += 16u) {
+                        u8 *block = gs_vram + (u32)((vram_bit_g(&trx_g, dbp, trx_ppr, trx_sax + bx, trx_y)
+                                                     - trx_g.off[0]) >> 3);
+                        const u8 *p = srow + bx;
+                        for (u32 r = 0; r < 16u; r++, p += trx_rrw) {
+                            const u8 *t = tb8 + r * 16u;
+                            block[t[0]] = p[0];   block[t[1]] = p[1];   block[t[2]] = p[2];   block[t[3]] = p[3];
+                            block[t[4]] = p[4];   block[t[5]] = p[5];   block[t[6]] = p[6];   block[t[7]] = p[7];
+                            block[t[8]] = p[8];   block[t[9]] = p[9];   block[t[10]] = p[10]; block[t[11]] = p[11];
+                            block[t[12]] = p[12]; block[t[13]] = p[13]; block[t[14]] = p[14]; block[t[15]] = p[15];
+                        }
+                    }
+                    ps2_gs_img_px[2] += bandpx;
+                    gs_stat_trxpix += bandpx;
+                    trx_left -= bandpx;
+                    i += bandpx;
+                    trx_y += 16u;
+                }
+                { extern volatile u8 ps2_gs_ph; ps2_gs_ph = 57; }
+            }
+        }
+        while (i < total && trx_left) {
+            const u32 xb = trx_x & trx_g.bwmask;
+            const u16 *off_row = trx_g.off + ((trx_y & trx_g.bhmask) << trx_g.bwsh);
+            u64 blkbit = vram_bit_g(&trx_g, dbp, trx_ppr, trx_x, trx_y) - off_row[xb];
+            u32 run = trx_g.bw - xb, k;
+            if (trx_x < xend && run > xend - trx_x) run = xend - trx_x;
+            if (run > total - i) run = total - i;
+            if (run > trx_left) run = trx_left;
+            if (!run) break;
+            {   const u32 base = (u32)(blkbit >> 3);
+                if (base <= GS_VRAM_SIZE - 1024u) {
+                    u8 *block = gs_vram + base;
+                    int same = 0;   /* this run matches VRAM already: nothing to write */
+                    ps2_gs_img_px[bits == 32u ? 0 : bits == 16u ? 1 : bits == 8u ? 2 : 3] += run;
+                    if (PS2_UNLIKELY(trx_dirty_pending)) {
+                        int diff = 0;
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 52; }
+                        ps2_gs_img_cmp_px += run;
+                        if (bits == 32u) {
+                            const u8 *p = src + (size_t)i * 4u;
+                            for (k = 0; k < run && !diff; k++) {
+                                u32 a, b;
+                                memcpy(&a, block + (off_row[xb + k] >> 3), 4);
+                                memcpy(&b, p + k * 4u, 4);
+                                diff = a != b;
+                            }
+                        } else if (bits == 16u) {
+                            const u8 *p = src + (size_t)i * 2u;
+                            for (k = 0; k < run && !diff; k++)
+                                diff = memcmp(block + (off_row[xb + k] >> 3), p + k * 2u, 2) != 0;
+                        } else if (bits == 8u) {
+                            const u8 *p = src + i;
+                            for (k = 0; k < run && !diff; k++)
+                                diff = block[off_row[xb + k] >> 3] != p[k];
+                        } else {
+                            for (k = 0; k < run && !diff; k++) {
+                                u32 j = i + k, ob = off_row[xb + k];
+                                u32 nib = (src[j >> 1] >> ((j & 1u) << 2)) & 0xFu;
+                                u8 b = block[ob >> 3];
+                                diff = ((ob & 4u) ? (u32)(b >> 4) : (u32)(b & 0xFu)) != nib;
+                            }
+                        }
+                        if (diff) trx_touch();
+                        else same = 1;
+                    }
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 53; }
+                    if (same) {
+                        /* identical re-upload: skip the second pass over it */
+                    } else if (bits == 32u) {
+                        /* CT32 keeps pixel pairs (x, x+1) side by side in a
+                         * block: copy 8 bytes at a time where they are */
+                        const u8 *p = src + (size_t)i * 4u;
+                        static int rowfast = -1;
+                        k = 0;
+                        if (rowfast < 0) rowfast = !getenv("AC5_TRX_NOROW");
+                        if (rowfast && !xb && run == 8u) {
+                            /* a whole 8-pixel block row: four pairs at offsets
+                             * fixed by the row, no per-pixel table walk */
+                            const u32 a0 = off_row[0] >> 3, a1 = off_row[2] >> 3;
+                            const u32 a2 = off_row[4] >> 3, a3 = off_row[6] >> 3;
+                            if ((off_row[1] >> 3) == a0 + 4u && (off_row[3] >> 3) == a1 + 4u
+                                && (off_row[5] >> 3) == a2 + 4u && (off_row[7] >> 3) == a3 + 4u) {
+                                memcpy(block + a0, p, 8);
+                                memcpy(block + a1, p + 8, 8);
+                                memcpy(block + a2, p + 16, 8);
+                                memcpy(block + a3, p + 24, 8);
+                                k = 8u;
+                            }
+                        }
+                        if (!k && !(xb & 1u))
+                            for (; k + 2u <= run; k += 2u) {
+                                const u32 o0 = off_row[xb + k] >> 3, o1 = off_row[xb + k + 1u] >> 3;
+                                u64 w;
+                                memcpy(&w, p + k * 4u, 8);
+                                if (o1 == o0 + 4u) memcpy(block + o0, &w, 8);
+                                else { memcpy(block + o0, &w, 4); memcpy(block + o1, (u8 *)&w + 4, 4); }
+                            }
+                        for (; k < run; k++)
+                            memcpy(block + (off_row[xb + k] >> 3), p + k * 4u, 4);
+                    } else if (bits == 16u) {
+                        const u8 *p = src + (size_t)i * 2u;
+                        for (k = 0; k < run; k++)
+                            memcpy(block + (off_row[xb + k] >> 3), p + k * 2u, 2);
+                    } else if (bits == 8u) {
+                        const u8 *p = src + i;
+                        for (k = 0; k < run; k++)
+                            block[off_row[xb + k] >> 3] = p[k];
+                    } else {
+                        for (k = 0; k < run; k++) {
+                            u32 j = i + k, ob = off_row[xb + k];
+                            u32 nib = (src[j >> 1] >> ((j & 1u) << 2)) & 0xFu;
+                            u8 *b = block + (ob >> 3);
+                            *b = (ob & 4u) ? (u8)((*b & 0x0Fu) | (nib << 4))
+                                           : (u8)((*b & 0xF0u) | nib);
+                        }
+                    }
+                } else {
+                    for (k = 0; k < run; k++) {
+                        u64 bit = blkbit + off_row[xb + k];
+                        u32 off = (u32)(bit >> 3), j = i + k, v;
+                        if (bits == 32u) memcpy(&v, src + (size_t)j * 4u, 4);
+                        else if (bits == 16u) { u16 h; memcpy(&h, src + (size_t)j * 2u, 2); v = h; }
+                        else if (bits == 8u) v = src[j];
+                        else v = (src[j >> 1] >> ((j & 1u) << 2)) & 0xFu;
+                        vram_store_b(off, bit, trx_dpsm, bits, v);
+                    }
+                }
+            }
+            gs_stat_trxpix += run;
+            trx_x += run;
+            trx_left -= run;
+            i += run;
+            if (trx_x >= xend) { trx_x = trx_sax; trx_y++; }
+        }
+{ extern volatile u8 ps2_gs_ph; ps2_gs_ph = 54; }
+        if (uprec_cur >= 0) {        /* the upload recorder keeps the raw bytes */
+            uprec *r = &uprecs[uprec_cur];
+            u32 n = r->need - r->pos, have = (i * bits + 7u) / 8u;
+            if (n > have) n = have;
+            memcpy(r->bytes + r->pos, src, n);
+            r->pos += n;
+        }
+        if (!trx_left && !trx_changed) {
+            ps2_gs_trx_unchanged++;
+            trx_dirty_pending = 0;
+        trx_unchanged_done();
+        } else if (!trx_left)
+            gs_dirty_rect(dbp, trx_dbw ? trx_dbw : 64u, trx_dpsm,
+                          (u32)((gs_reg[GS_TRXPOS] >> 32) & 0x7FFull),
+                          (u32)((gs_reg[GS_TRXPOS] >> 48) & 0x7FFull),
+                          trx_rrw, (u32)((gs_reg[GS_TRXREG] >> 32) & 0xFFFull));
+        if (uprec_cur >= 0 && !trx_left) uprec_finish();
+        trx_fast_qw += qwc;
+        /* whole quadwords consumed; a partial one cannot occur for CT32 */
+        return i ? qwc : 0;
+    }
+}
+
+u64 ps2_gs_img_us, ps2_gs_img_fast_qw, ps2_gs_img_slow_qw, ps2_gs_trxbeg_us;
+static void ps2_gs_hwreg_stream_inner(const void *data, u32 qwc);
 void ps2_gs_hwreg_stream(const void *data, u32 qwc) {
+    if (PS2_GSQ_DEFER()) { ps2_gsq_hwstream(data, qwc); return; }
+    u64 t0 = TL_NOW();
+    ps2_gs_img_calls++;
+    ps2_gs_hwreg_stream_inner(data, qwc);
+    ps2_gs_img_us += TL_NOW() - t0;
+}
+static void ps2_gs_hwreg_stream_inner(const void *data, u32 qwc) {
     const u8 *src = (const u8 *)data;
+    { extern volatile u8 ps2_gs_ph; ps2_gs_ph = 49; }
     gs_stat_regs += (u64)qwc * 2u;
     gs_reg_hist[GS_HWREG] += (u64)qwc * 2u;
     PS2_PHASE_BEGIN(PS2_PH_TRX);
+    /* the first words of a transfer go the slow way when they are being
+     * captured; the rest can take the bulk path */
+    while (qwc && trxc_cur >= 0 && trxc[trxc_cur].got < 4) {
+        u64 words[2];
+        memcpy(words, src, sizeof(words));
+        gs_reg[GS_HWREG] = words[1];
+        trx_data_inner(words[0]);
+        trx_data_inner(words[1]);
+        src += 16; qwc--;
+    }
+    if (qwc && trx_stream_ct32(src, qwc)) {
+        u64 last[2];
+        ps2_gs_img_fast_qw += qwc;
+        memcpy(last, src + (size_t)(qwc - 1u) * 16u, sizeof last);
+        gs_reg[GS_HWREG] = last[1];
+        PS2_PHASE_END(PS2_PH_TRX);
+        return;
+    }
+    trx_slow_qw += qwc;
+    ps2_gs_img_slow_qw += qwc;
+    {   extern volatile u8 ps2_gs_ph; ps2_gs_ph = 25; }
+    {   static int said;
+        if (qwc >= 1024 && said < 6) {
+            said++;
+            ps2_log("gs: bulk image path not taken for %u qw (psm %u, npix %u, uprec %d, trxc %d, left %u)",
+                    qwc, trx_dpsm, trx_npix, uprec_cur, trxc_cur, trx_left);
+        }
+    }
     for (u32 i = 0; i < qwc; i++) {
         u64 words[2];
         memcpy(words, src + (size_t)i * 16u, sizeof(words));
@@ -4221,7 +5276,7 @@ int ps2_gs_selftest(void) {
             u32 mask = (bits >= 32u) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
             u32 w = 128, h = 64, bad = 0;
             if (psm == PSM_CT24 || psm == PSM_Z24) mask = 0x00FFFFFFu;
-            memset(gs_vram, 0, GS_VRAM_SIZE);
+            memset(gs_vram, 0, GS_VRAM_SIZE); gs_epoch_seq_clut_ok++; memset(pg_hash_ep, 0, sizeof pg_hash_ep);
             for (y = 0; y < h; y++)
                 for (x = 0; x < w; x++)
                     vram_put(0, w, x, y, psm,
@@ -4236,7 +5291,7 @@ int ps2_gs_selftest(void) {
                 gs_expect(nm, bad, 0);
             }
         }
-        memset(gs_vram, 0, GS_VRAM_SIZE);
+        memset(gs_vram, 0, GS_VRAM_SIZE); gs_epoch_seq_clut_ok++; memset(pg_hash_ep, 0, sizeof pg_hash_ep);
     }
 
     {
@@ -4270,3 +5325,20 @@ int ps2_gs_selftest(void) {
     ps2_log("gs selftest: %s", gs_test_fail ? "FAILED" : "all checks passed");
     return gs_test_fail ? 1 : 0;
 }
+
+#ifdef PS2_VITA
+void ps2_gs_bench(void) {
+    static u8 buf[1 << 20];
+    struct timespec a, b;
+    u32 i, h = 0;
+    for (i = 0; i < sizeof buf; i++) buf[i] = (u8)(i * 13u);
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (i = 0; i < 16; i++) h ^= raw_pages_hash(buf, sizeof buf, i);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    {   double us = (double)(b.tv_sec - a.tv_sec) * 1e6 + (double)(b.tv_nsec - a.tv_nsec) / 1e3;
+        ps2_log("bench: texture recognition hash %.0f MB/s%s", 16.0 * 1e6 / (us > 0 ? us : 1),
+                h == 0x12345u ? " " : "");
+    }
+    ps2_gs_rawc_bytes = 0;
+}
+#endif

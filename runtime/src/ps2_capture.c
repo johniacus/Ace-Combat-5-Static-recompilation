@@ -620,9 +620,19 @@ void ps2_cap_maybe_start(void) {
         level = g_reqlevel;
         g_req_pending = 0;
     } else {
-        FILE *mk = fopen("capture.on", "rb");
+        FILE *mk;
         char buf[64];
         int marked = 0;
+#ifdef PS2_VITA
+        /* a file open every field on the GS thread waits behind the disc
+         * streaming on the memory card (build 96): look once every ~4 s,
+         * and only when AC5_CAPTURE is set */
+        {   static int on = -1; static u32 n;
+            if (on < 0) on = getenv("AC5_CAPTURE") != NULL;
+            if (!on || (n++ & 255u)) return;
+        }
+#endif
+        mk = fopen("capture.on", "rb");
         if (!mk) return;
         frames = g_cfg_frames;
         level = g_cfg_level;

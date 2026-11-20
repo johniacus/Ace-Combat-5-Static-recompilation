@@ -467,6 +467,7 @@ extern u64 ps2_phase_cycles[PS2_PH_N];
 extern u64 ps2_phase_self[PS2_PH_N];
 extern u64 ps2_phase_calls[PS2_PH_N];
 extern int ps2_phase_on;
+void ps2_phase_field_tick(void);
 extern __thread u64 ps2_phase_child;
 void ps2_phase_init(void);
 void ps2_phase_report(u64 fields);
@@ -491,7 +492,7 @@ PS2_INLINE u64 ps2_tsc(void) { return 0; }
         ps2_ph_t0_##p = ps2_tsc();                                            \
     }
 #define PS2_PHASE_END(p)                                                      \
-    do { if (ps2_phase_on) {                                                  \
+    do { if (ps2_ph_t0_##p) {                                                 \
         u64 ps2_ph_d = ps2_tsc() - ps2_ph_t0_##p;                             \
         ps2_phase_cycles[p] += ps2_ph_d;                                      \
         ps2_phase_self[p] += ps2_ph_d - ps2_phase_child;                      \

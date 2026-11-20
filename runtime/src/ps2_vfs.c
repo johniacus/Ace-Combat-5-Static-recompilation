@@ -145,6 +145,22 @@ static int seek64(FILE *fp, u64 off) { return _fseeki64(fp, (long long)off, SEEK
 static int seek64(FILE *fp, u64 off) { return fseeko(fp, (off_t)off, SEEK_SET); }
 #endif
 
+/* Positional reads from the disc image. On the PS Vita newlib's off_t is 32
+ * bits, so fseeko cannot reach past 2 GB of a 4.4 GB DVD image; read the
+ * image through the kernel's 64-bit sceIoPread instead. */
+#ifdef PS2_VITA
+#include <psp2/io/fcntl.h>
+static SceUID image_uid = -1;
+static int image_pread(FILE *fp, u64 off, void *dst, size_t n) {
+    (void)fp;
+    return image_uid >= 0 && sceIoPread(image_uid, dst, (SceSize)n, (SceOff)off) == (int)n;
+}
+#else
+static int image_pread(FILE *fp, u64 off, void *dst, size_t n) {
+    return fp && seek64(fp, off) == 0 && fread(dst, 1, n, fp) == n;
+}
+#endif
+
 static int host_stat(const char *path, u64 *size, int *is_dir) {
 #ifdef _WIN32
     struct _stat64 st;
@@ -264,8 +280,7 @@ static void node_read(vfs_node *n, u64 pos, u32 len, u8 *dst) {
         memcpy(dst, n->mem + pos, data);
         return;
     case SRC_IMAGE:
-        if (image_fp && seek64(image_fp, n->image_off + pos) == 0
-            && fread(dst, 1, data, image_fp) == data)
+        if (image_fp && image_pread(image_fp, n->image_off + pos, dst, data))
             return;
         break;
     case SRC_TREE:
@@ -334,11 +349,20 @@ int ps2_vfs_read_sectors_guest(u32 lsn, u32 sectors, u32 guest_addr) {
     u8 *buf;
     u32 done = 0;
     if (!vfs_opened) return -1;
-    buf = (u8 *)malloc((size_t)(sectors < CHUNK ? (sectors ? sectors : 1u) : CHUNK)
-                       * SECTOR);
-    if (!buf) return -1;
+    u32 chunk = sectors < CHUNK ? (sectors ? sectors : 1u) : CHUNK;
+    buf = (u8 *)malloc((size_t)chunk * SECTOR);
+    while (!buf && chunk > 1u) {          /* low memory: use a smaller bounce buffer */
+        chunk /= 4u;
+        if (!chunk) chunk = 1u;
+        buf = (u8 *)malloc((size_t)chunk * SECTOR);
+    }
+    if (!buf) {
+        static int said;
+        if (said++ < 4) ps2_log("vfs: out of memory for a %u-sector read", sectors);
+        return -1;
+    }
     while (done < sectors) {
-        u32 run = sectors - done < CHUNK ? sectors - done : CHUNK;
+        u32 run = sectors - done < chunk ? sectors - done : chunk;
         ps2_vfs_read_sectors(lsn + done, run, buf);
         guest_put(guest_addr + done * SECTOR, buf, run * SECTOR);
         done += run;
@@ -391,8 +415,7 @@ u32 ps2_vfs_file_count(void) { return nnodes; }
 int ps2_vfs_ready(void) { return vfs_opened; }
 
 static int image_sector(u32 lsn, u8 *dst) {
-    return (image_fp && seek64(image_fp, (u64)lsn * SECTOR) == 0
-            && fread(dst, 1, SECTOR, image_fp) == SECTOR) ? 0 : -1;
+    return (image_fp && image_pread(image_fp, (u64)lsn * SECTOR, dst, SECTOR)) ? 0 : -1;
 }
 
 static void image_scan_dir(u32 lsn, u32 size, const char *prefix, int depth) {
@@ -1335,11 +1358,18 @@ int ps2_vfs_open(const char *path) {
         u8 pvd[SECTOR];
         u32 root_lsn, root_size;
         image_fp = fopen(path, "rb");
+#ifdef PS2_VITA
+        image_uid = sceIoOpen(path, SCE_O_RDONLY, 0);
+#endif
         if (!image_fp || image_sector(16, pvd) != 0
             || memcmp(pvd + 1, "CD001", 5) != 0) {
             ps2_log("vfs: '%s' is not an ISO9660 image", path);
             if (image_fp) fclose(image_fp);
             image_fp = NULL;
+#ifdef PS2_VITA
+            if (image_uid >= 0) sceIoClose(image_uid);
+            image_uid = -1;
+#endif
             return -1;
         }
         memcpy(&root_lsn, pvd + 156 + 2, 4);

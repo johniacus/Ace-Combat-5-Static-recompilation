@@ -1,4 +1,12 @@
 #include "ps2_runtime.h"
+
+#ifdef PS2_VITA
+/* ARM has no rdtsc here: time the phase profiler with the process clock. */
+u64 vita_tsc(void);
+#undef ps2_tsc
+#define ps2_tsc() vita_tsc()
+#endif
+
 #include "ps2_hle.h"
 #include "ps2_capture.h"
 #include "rn.h"
@@ -92,6 +100,18 @@ typedef struct {
 static vu_prog vu_progs[VU_PROG_N];
 static u32 vu_prog_n;
 static u64 vu_prog_dropped;
+int ac5_prof;   /* AC5_PROF: the worker's fine-grained timers (cost ~1 ms a field) */
+#ifdef PS2_VITA
+#include <psp2/kernel/processmgr.h>
+#define VT_NOW() (ac5_prof ? sceKernelGetProcessTimeWide() : 0ull)
+#else
+#define VT_NOW() 0ull
+#endif
+/* worker timing: VIF0/VIF1 transfers and the microprograms they start */
+u64 ps2_vt_vif_us[2], ps2_vt_vif_n[2], ps2_vt_run_us[2], ps2_vt_run_n[2], ps2_vt_vu0_insns;
+/* cheap counters for the slow-field log */
+u64 ps2_vc_slow_words, ps2_vc_vifcode_words, ps2_vc_direct_qw, ps2_vc_fifo_qw, ps2_vt_direct_us;
+u64 ps2_vc_slow_fmt[64], ps2_vc_code_cmd[128];
 static int vu_census_on = -1;
 static int vu_prog_dirty = 1;
 static u64 vu_prog_crc;
@@ -108,6 +128,29 @@ static int vu_census_enabled(void) {
     return vu_census_on;
 }
 
+/* Identity of the VU1 microcode image, kept up to date as MPG writes it:
+ * a sum of per-quadword mixes, so one rewritten quadword costs two mixes
+ * instead of rehashing all 16 KB (a byte-wise 64-bit FNV, ~0.3 ms on the
+ * Vita) every time the game switches microprograms. */
+static u64 vu1_mh;
+static int vu1_mh_valid;
+static inline u64 mh_mix(u32 idx, const u8 *q) {
+    u64 a, b, m;
+    memcpy(&a, q, 8); memcpy(&b, q + 8, 8);
+    m = a * 0x9E3779B97F4A7C15ull ^ (b + (u64)idx * 0x632BE59BD9B4E019ull) * 0xC2B2AE3D27D4EB4Full;
+    m ^= m >> 31; m *= 0xBF58476D1CE4E5B9ull; m ^= m >> 29;
+    return m;
+}
+static u64 vu1_micro_hash(const u8 *micro, u32 size) {
+    if (!vu1_mh_valid) {
+        u64 h = 0;
+        for (u32 i = 0; i < size / 16u; i++) h += mh_mix(i, micro + i * 16u);
+        vu1_mh = h;
+        vu1_mh_valid = 1;
+    }
+    return vu1_mh;
+}
+u64 ps2_vu1_micro_id(void) { return vu1.micro ? vu1_micro_hash(vu1.micro, vu1.micro_size) : 0; }
 static u64 vu_hash(const u8 *p, u32 n) {
     u64 h = 1469598103934665603ull;
     u32 i;
@@ -1166,7 +1209,7 @@ static int vu1_sig_match(const u8 *m, int i) {
 
 static void vu1_resident_update(ps2_vu *vu) {
     u32 k;
-    vu_prog_crc = vu_hash(vu->micro, vu->micro_size);
+    vu_prog_crc = vu1_micro_hash(vu->micro, vu->micro_size);
     vu_prog_dirty = 0;
     vu1_resident_fn = NULL;
 #ifdef VU1_HAVE_RECOMP
@@ -1195,6 +1238,16 @@ static void vu1_resident_update(ps2_vu *vu) {
 #else
     (void)k;
 #endif
+}
+
+/* The Vita build is usually closed from the home screen, never reaching
+ * the exit report: write the census every 30 s of fields as well. Called
+ * from the graphics worker, which owns the census. */
+void ps2_vu_census_dump(void);
+void ps2_vu_census_tick(void) {
+    static u32 n;
+    if (!vu_census_enabled()) return;
+    if (++n % 1800u == 0u) ps2_vu_census_dump();
 }
 
 static vu_prog *vu_census_enter(ps2_vu *vu, u32 start) {
@@ -1352,6 +1405,16 @@ static int vu1_try_recomp(ps2_vu *vu, u32 *pc, u32 *guard, u32 *fslot,
     *stopped = r == 1;
     if (*stopped) vu1_recomp_runs++;
     return 1;
+}
+
+/* 5-second window for the Vita status log */
+void ps2_vu_recomp_window(void) {
+    static u64 lr, lb, li;
+    u64 r = vu1_recomp_runs - lr, b = vu1_recomp_bails - lb, i = vu1_interp_runs - li;
+    lr = vu1_recomp_runs; lb = vu1_recomp_bails; li = vu1_interp_runs;
+    if (r || b || i)
+        ps2_log("vu1: %llu runs as recompiled C, %llu handed back mid-way, %llu interpreted",
+                (unsigned long long)r, (unsigned long long)b, (unsigned long long)i);
 }
 
 void ps2_vu_recomp_report(void) {
@@ -1622,6 +1685,19 @@ void ps2_vif_unpack_report(void) {
                 (unsigned long long)vif_unpack_cens[i].n);
 }
 
+/* n / d and n % d for the small cycle lengths UNPACK uses. The Vita's
+ * Cortex-A9 has no divide instruction, and these ran several times for every
+ * unpacked element (about a million a second in missions). */
+static inline u32 vif_divmod(u32 n, u32 d, u32 *r) {
+    if (d == 1u) { *r = 0; return n; }
+    if (!(d & (d - 1u))) {
+        u32 sh = (u32)__builtin_ctz(d);
+        *r = n & (d - 1u);
+        return n >> sh;
+    }
+    *r = n % d;
+    return n / d;
+}
 static u32 vif_unpack_bits(const ps2_vif *v) {
     return (32u >> v->unpack_vl) * (v->unpack_vn + 1u);
 }
@@ -1629,18 +1705,24 @@ static u32 vif_unpack_bits(const ps2_vif *v) {
 static int vif_unpack_is_fill(const ps2_vif *v) {
     u32 cl = v->unpack_cl, wl = v->unpack_wl;
     if (cl >= wl) return 0;
-    return (v->unpack_written % wl) >= cl;
+    {   u32 r; (void)vif_divmod(v->unpack_written, wl, &r); return r >= cl; }
 }
 
 static u32 vif_unpack_dest(const ps2_vif *v) {
     u32 n = v->unpack_written, cl = v->unpack_cl, wl = v->unpack_wl;
-    if (cl >= wl) return v->unpack_base + cl * (n / wl) + (n % wl);
+    if (cl >= wl) {
+        u32 r, q;
+        if (cl == wl) return v->unpack_base + n;
+        q = vif_divmod(n, wl, &r);
+        return v->unpack_base + cl * q + r;
+    }
     return v->unpack_base + n;
 }
 
 static void vif_unpack_emit(ps2_vif *v, ps2_vu *vu, const u32 *data, int have) {
     u32 addr = (vif_unpack_dest(v) * 16u) & (vu->mem_size - 16u);
-    u32 cycle = v->unpack_written % (v->unpack_wl ? v->unpack_wl : 1u);
+    u32 cycle;
+    (void)vif_divmod(v->unpack_written, v->unpack_wl ? v->unpack_wl : 1u, &cycle);
     u32 row_sel = cycle < 3u ? cycle : 3u;
     int i;
     for (i = 0; i < 4; i++) {
@@ -1702,8 +1784,10 @@ static void vif_unpack_element(ps2_vif *v, ps2_vu *vu) {
     vif_unpack_emit(v, vu, out, have);
 }
 
-static int vif_v3_zero_w(const ps2_vif *v) {
-    u32 n = v->unpack_index, a = v->unpack_align;
+static int vif_v3_zero_w_n(const ps2_vif *v, u32 n);
+static int vif_v3_zero_w(const ps2_vif *v) { return vif_v3_zero_w_n(v, v->unpack_index); }
+static int vif_v3_zero_w_n(const ps2_vif *v, u32 n) {
+    u32 a = v->unpack_align;
     if (v->unpack_vl == 0u) return (n & 1u) != (a & 1u);
     if (v->unpack_vl == 1u)
         return !((n + 1u) & 1u) && ((((n + 1u) / 4u + 1u + 4u - a) & 3u) == 0);
@@ -1893,13 +1977,23 @@ static void vif_exec_code(ps2_vif *v, u32 code) {
                             imm, imm * 8u, imm);
             }
         }
-        if (vu1_ready || !v->is_vif1) vu_run(vu, imm * 8u);
+        if (vu1_ready || !v->is_vif1) {
+            u64 vt0 = VT_NOW();
+            vu_run(vu, imm * 8u);
+            ps2_vt_run_us[v->is_vif1 ? 1 : 0] += VT_NOW() - vt0;
+            ps2_vt_run_n[v->is_vif1 ? 1 : 0]++;
+        }
         break;
     case 0x17:
         vif_activate(v, vu);
         vu_stat_mscal++;
         if (v->is_vif1) vu_mscnt_n++;
-        if (vu1_ready || !v->is_vif1) vu_run(vu, vu->tpc);
+        if (vu1_ready || !v->is_vif1) {
+            u64 vt0 = VT_NOW();
+            vu_run(vu, vu->tpc);
+            ps2_vt_run_us[v->is_vif1 ? 1 : 0] += VT_NOW() - vt0;
+            ps2_vt_run_n[v->is_vif1 ? 1 : 0]++;
+        }
         break;
     case 0x20: v->wait = 1; break;
     case 0x30: v->wait = 4; break;
@@ -1940,6 +2034,10 @@ static void vif_data_qw(ps2_vif *v, const ps2_reg128 *q) {
         if (off + 16u > vu->micro_size) break;
         vu_stat_mpg++;
         if (memcmp(vu->micro + off, q, 16) != 0) {
+            if (v->is_vif1 && vu1_mh_valid) {
+                vu1_mh -= mh_mix(off / 16u, vu->micro + off);
+                vu1_mh += mh_mix(off / 16u, (const u8 *)q);
+            }
             memcpy(vu->micro + off, q, 16);
             vu_prog_dirty = 1;
             rn_vp_dirty = 1;
@@ -1993,11 +2091,178 @@ static void vif_word(ps2_vif *v, u32 w) {
     }
 }
 
-static void vif_quadword(ps2_vif *v, const u32 *words) {
-    u32 lane = 0;
-    v->word_lane = 0;
+u64 ps2_vif_fast_qw;
+/* Whole elements of the common unmasked, mode-0 UNPACKs (V4-8, V2-32,
+ * V3-32), written straight to VU memory when nothing is pending in the bit
+ * stream: the same results as vif_unpack_stream's word-by-word path, which
+ * missions spent most of their unpacking in. AC5_VIF_FAST=0 turns it off. */
+u64 ps2_vc_elem_words;
+static inline void vif_emit_plain(ps2_vif *v, ps2_vu *vu, const u32 *out) {
+    u32 addr = (vif_unpack_dest(v) * 16u) & (vu->mem_size - 16u);
+    memcpy(vu->mem + addr, out, 16);
+    v->unpack_written++;
+    if (v->unpack_num) v->unpack_num--;
+    if (v->num) v->num--;
+}
+/* w[0..n) are the next n words of the stream (any number of quadwords). */
+static u32 vif_elem_flat(ps2_vif *v, ps2_vu *vu, const u32 *w, u32 n) {
+    static int on = -1;
+    u32 pos = 0, out[4];
+    /* AC5_VIF_FAST: 0 off, or a mask of formats: 1 V4-8, 2 V2-32, 4 V3-32,
+     * 8 V3-16. Default 15 again from build 87: builds 83-86 decoded as many
+     * textures with V3-32 off, so it was not the cause, and a host test finds
+     * every format identical to the word-by-word path. */
+    if (on < 0) { const char *e = getenv("AC5_VIF_FAST"); on = e ? (int)strtol(e, NULL, 0) : 15; }
+    if (!on || v->unpack_m || v->mode || v->nbits || v->elem_n || !v->unpack_wl
+        || v->unpack_cl < v->unpack_wl || !vu->mem)
+        return 0;
+    if (v->unpack_vn == 3u && v->unpack_vl == 2u && (on & 1)) {            /* V4-8 */
+        while (pos < n && v->wait && v->unpack_num) {
+            u32 x = w[pos];
+            for (u32 i = 0; i < 4u; i++) {
+                u32 b = (x >> (i * 8u)) & 0xFFu;
+                out[i] = v->unpack_usn ? b : (u32)(s32)(s8)(u8)b;
+            }
+            vif_emit_plain(v, vu, out);
+            v->unpack_index++;
+            v->wait--;
+            pos++;
+        }
+    } else if (v->unpack_vn == 1u && v->unpack_vl == 0u && (on & 2)) {    /* V2-32 */
+        while (pos + 2u <= n && v->wait >= 2u && v->unpack_num) {
+            out[0] = w[pos]; out[1] = w[pos + 1u];
+            out[2] = out[0];
+            out[3] = (v->unpack_align & 1u) ? 0u : out[1];
+            vif_emit_plain(v, vu, out);
+            v->unpack_index++;
+            v->wait -= 2u;
+            pos += 2u;
+        }
+    } else if (v->unpack_vn == 2u && v->unpack_vl == 0u && (on & 4)) {    /* V3-32 */
+        while (pos + 3u <= n && v->wait >= 3u && v->unpack_num) {
+            int zero = vif_v3_zero_w(v);
+            /* W is the next word of the stream, read but not consumed */
+            if (!zero && (pos + 4u > n || v->wait < 4u)) break;
+            out[0] = w[pos]; out[1] = w[pos + 1u]; out[2] = w[pos + 2u];
+            out[3] = zero ? 0u : w[pos + 3u];
+            vif_emit_plain(v, vu, out);
+            v->unpack_index++;
+            v->wait -= 3u;
+            pos += 3u;
+        }
+    } else if (v->unpack_vn == 2u && v->unpack_vl == 1u && (on & 8)) {    /* V3-16, two elements per 3 words */
+        while (pos + 3u <= n && v->wait >= 3u && v->unpack_num >= 2u) {
+            const u32 w0 = w[pos], w1 = w[pos + 1u], w2 = w[pos + 2u];
+            u32 h[6] = { w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16, w2 & 0xFFFFu, w2 >> 16 };
+            int zero0 = vif_v3_zero_w(v), zero1;
+            u32 w3lo = 0;
+            #define V16(x) (v->unpack_usn ? (x) : (u32)(s32)(s16)(u16)(x))
+            /* first element: x y z, W the next 16 bits (x of the second) */
+            out[0] = V16(h[0]); out[1] = V16(h[1]); out[2] = V16(h[2]);
+            out[3] = zero0 ? 0u : V16(h[3]);
+            /* second element's W is the 16 bits after it: the next word */
+            zero1 = vif_v3_zero_w_n(v, v->unpack_index + 1u);
+            if (!zero1) {
+                if (pos + 4u > n || v->wait < 4u) break;
+                w3lo = w[pos + 3u] & 0xFFFFu;
+            }
+            vif_emit_plain(v, vu, out);
+            v->unpack_index++;
+            out[0] = V16(h[3]); out[1] = V16(h[4]); out[2] = V16(h[5]);
+            out[3] = zero1 ? 0u : V16(w3lo);
+            vif_emit_plain(v, vu, out);
+            v->unpack_index++;
+            #undef V16
+            v->wait -= 3u;
+            pos += 3u;
+        }
+    }
+    /* the word-by-word path leaves its bit buffer at 0 when nothing is
+     * pending; leaving the last word in it here OR-ed stale bits into the
+     * next unpack's data (builds 79-81: textures kept changing) */
+    if (pos) v->bits = 0;
+    ps2_vc_elem_words += pos;
+    vu_stat_unpack += pos;
+    return pos;
+}
+/* AC5_VIF_CHECK=1: run the word-by-word path on a copy alongside every
+ * fast-path run and log where they disagree (slow; for finding why V3-32
+ * on the fast path changed what missions drew). */
+static u32 vif_elem_checked(ps2_vif *v, ps2_vu *vu, const u32 *w, u32 n) {
+    static int chk = -1;
+    static u8 *mem0;
+    static u32 shown;
+    ps2_vif v0;
+    u32 took;
+    if (chk < 0) { chk = getenv("AC5_VIF_CHECK") ? 1 : 0; if (chk) ps2_log("vif: AC5_VIF_CHECK on"); }
+    if (!chk || !vu->mem) return vif_elem_flat(v, vu, w, n);
+    if (!mem0) mem0 = (u8 *)malloc(vu->mem_size);
+    if (!mem0) return vif_elem_flat(v, vu, w, n);
+    v0 = *v;
+    memcpy(mem0, vu->mem, vu->mem_size);
+    took = vif_elem_flat(v, vu, w, n);
+    if (took) {
+        ps2_vu t = *vu;
+        u8 *fast = vu->mem;
+        t.mem = mem0;
+        for (u32 i = 0; i < took; i++) { v0.wait--; vif_unpack_stream(&v0, &t, w[i]); }
+        if (memcmp(fast, mem0, vu->mem_size) || v0.unpack_index != v->unpack_index
+            || v0.unpack_written != v->unpack_written || v0.unpack_num != v->unpack_num
+            || v0.nbits != v->nbits || v0.elem_n != v->elem_n || v0.bits != v->bits) {
+            u32 k;
+            for (k = 0; k < vu->mem_size && fast[k] == mem0[k]; k++) ;
+            if (shown++ < 12u)
+                ps2_log("vif check: V%u-%u fast path differs after %u words: VU byte %u (qw %u) fast %02X slow %02X;"
+                        " index %u/%u written %u/%u num %u/%u nbits %u/%u elem_n %u/%u align %u cl %u wl %u",
+                        v->unpack_vn + 1u, 32u >> v->unpack_vl, took, k, k / 16u,
+                        k < vu->mem_size ? fast[k] : 0u, k < vu->mem_size ? mem0[k] : 0u,
+                        v->unpack_index, v0.unpack_index, v->unpack_written, v0.unpack_written,
+                        v->unpack_num, v0.unpack_num, v->nbits, v0.nbits, v->elem_n, v0.elem_n,
+                        v->unpack_align, v->unpack_cl, v->unpack_wl);
+        }
+    }
+    return took;
+}
+static u32 vif_elem_fast(ps2_vif *v, ps2_vu *vu, const u32 *words, u32 lane) {
+    return vif_elem_checked(v, vu, words + lane, 4u - lane);
+}
+
+static void vif_quadword_at(ps2_vif *v, const u32 *words, u32 lane);
+static void vif_quadword(ps2_vif *v, const u32 *words) { vif_quadword_at(v, words, 0); }
+static void vif_quadword_at(ps2_vif *v, const u32 *words, u32 lane) {
+    v->word_lane = lane & 3u;
+    /* Fast path: a whole quadword that is exactly one V4-32 element of an
+     * unmasked, unmodified UNPACK with no partial element pending -- the
+     * word-by-word bit stream would just copy it to VU memory. */
+    if (!lane && v->wait >= 4u && v->cmd >= 0x60u && !v->err_stall && v->unpack_num
+        && v->unpack_vn == 3u && v->unpack_vl == 0u && !v->unpack_m && !v->mode
+        && v->nbits == 0u && v->elem_n == 0u && v->unpack_cl >= v->unpack_wl
+        && v->unpack_wl) {
+        ps2_vu *vu = v->is_vif1 ? &vu1 : &ps2_cpu.vu0;
+        if (vu->mem) {
+            u32 addr = (vif_unpack_dest(v) * 16u) & (vu->mem_size - 16u);
+            memcpy(vu->mem + addr, words, 16);
+            v->unpack_written++;
+            v->unpack_index++;
+            v->unpack_num--;
+            if (v->num) v->num--;
+            v->wait -= 4u;
+            vu_stat_unpack += 4u;
+            ps2_vif_fast_qw++;
+            v->word_lane = 0;
+            return;
+        }
+    }
     while (lane < 4u) {
         if (v->wait && v->cmd >= 0x60u && !v->err_stall) {
+            {   ps2_vu *fvu = v->is_vif1 ? &vu1 : &ps2_cpu.vu0;
+                u32 took = vif_elem_fast(v, fvu, words, lane);
+                if (took) {
+                    lane += took;
+                    v->word_lane = lane & 3u;
+                    continue;
+                }
+            }
             u32 avail = 4u - lane;
             u32 n = v->wait < avail ? v->wait : avail;
             ps2_vu *vu = v->is_vif1 ? &vu1 : &ps2_cpu.vu0;
@@ -2008,24 +2273,37 @@ static void vif_quadword(ps2_vif *v, const u32 *words) {
                 vif_unpack_stream(v, vu, words[lane + k]);
             }
             PS2_PHASE_END(PS2_PH_UNPACK);
+            ps2_vc_slow_words += n;
+            ps2_vc_slow_fmt[(v->unpack_vn & 3u) | ((v->unpack_vl & 3u) << 2) | (v->unpack_m ? 16u : 0u)
+                            | (v->mode ? 32u : 0u)] += n;
             vu_stat_unpack += n;
             lane += n;
             v->word_lane = lane & 3u;
             continue;
         }
+        if (!v->wait && !v->num) ps2_vc_code_cmd[(words[lane] >> 24) & 0x7Fu]++;
         vif_word(v, words[lane]);
+        ps2_vc_vifcode_words++;
         lane++;
     }
 }
 
 void ps2_vif_fifo(int which, const ps2_reg128 *q) {
     ps2_vif *v = &vif[which & 1];
+    ps2_vc_fifo_qw++;
     PS2_PHASE_BEGIN(PS2_PH_VIF);
     vif_quadword(v, q->uw);
     PS2_PHASE_END(PS2_PH_VIF);
 }
 
+static void ps2_vif_transfer_inner(int which, const ps2_reg128 *q, u32 qwc);
 void ps2_vif_transfer(int which, const ps2_reg128 *q, u32 qwc) {
+    u64 vt0 = VT_NOW();
+    ps2_vif_transfer_inner(which, q, qwc);
+    ps2_vt_vif_us[which & 1] += VT_NOW() - vt0;
+    ps2_vt_vif_n[which & 1]++;
+}
+static void ps2_vif_transfer_inner(int which, const ps2_reg128 *q, u32 qwc) {
     ps2_vif *v = &vif[which & 1];
     const u8 *src = (const u8 *)q;
     PS2_PHASE_BEGIN(PS2_PH_VIF);
@@ -2038,10 +2316,39 @@ void ps2_vif_transfer(int which, const ps2_reg128 *q, u32 qwc) {
             v->word_lane = 0;
             memcpy(v->acc, src + (size_t)(i + n - 1u) * 16u, 16);
             ps2_gif_path = 2;
-            ps2_gif_transfer((const ps2_reg128 *)(src + (size_t)i * 16u), n);
+            {   extern u64 ps2_vt_direct_us;
+                u64 d0 = VT_NOW();
+                ps2_gif_transfer((const ps2_reg128 *)(src + (size_t)i * 16u), n);
+                ps2_vt_direct_us += VT_NOW() - d0; }
             ps2_gif_path = 0;
+            ps2_vc_direct_qw += n;
             i += n;
             continue;
+        }
+        if (v->cmd >= 0x60u && v->wait && !v->err_stall && !ps2_diag_armed
+            && !g_cap_shallow && !g_cap_deep) {
+            /* the gfxq ring hands VIF data on at 2 bytes past alignment:
+             * copy up to 64 quadwords into an aligned buffer first (before
+             * build 84 this path only ran on aligned data, i.e. never) */
+            ps2_vu *fvu = v->is_vif1 ? &vu1 : &ps2_cpu.vu0;
+            u32 nq = qwc - i > 64u ? 64u : qwc - i;
+            u32 tmp[256];
+            const u32 *wp;
+            if (((uintptr_t)(src + (size_t)i * 16u)) & 3u) {
+                memcpy(tmp, src + (size_t)i * 16u, (size_t)nq * 16u);
+                wp = tmp;
+            } else wp = (const u32 *)(const void *)(src + (size_t)i * 16u);
+            u32 took = vif_elem_checked(v, fvu, wp, nq * 4u);
+            if (took) {
+                i += took / 4u;
+                if (took & 3u) {
+                    u32 words[4];
+                    memcpy(words, src + (size_t)i * 16u, sizeof(words));
+                    vif_quadword_at(v, words, took & 3u);
+                    i++;
+                } else v->word_lane = 0;
+                continue;
+            }
         }
         u32 words[4];
         memcpy(words, src + (size_t)i * 16u, sizeof(words));
@@ -2102,6 +2409,8 @@ void ps2_vu_cap_load(const ps2_vu_capstate *st) {
     mem = vu1.mem; micro = vu1.micro; msz = vu1.mem_size; usz = vu1.micro_size;
     vu1 = st->vu1;
     rn_vp_dirty = 1;
+    vu_prog_dirty = 1;
+    vu1_mh_valid = 0;
     vu1.mem = mem; vu1.micro = micro;
     vu1.mem_size = msz; vu1.micro_size = usz;
     mem = ps2_cpu.vu0.mem; micro = ps2_cpu.vu0.micro;
@@ -2175,20 +2484,28 @@ void ps2_vif_hist_report(void) {
     ps2_vif_sync_report();
 }
 
+#ifdef PS2_VITA
+#define VU_CENSUS_DIR "ux0:data/ac5/out/vu_programs"
+#else
+#define VU_CENSUS_DIR "out/vu_programs"
+#endif
 void ps2_vu_census_dump(void) {
     char path[512];
     FILE *mf;
     u32 i, j;
     if (!vu_census_enabled() || !vu_prog_n) return;
-    ps2_mkdir_p("out/vu_programs");
-    snprintf(path, sizeof path, "out/vu_programs/manifest.json");
+#ifdef PS2_VITA
+    ps2_mkdir_p("ux0:data/ac5/out");
+#endif
+    ps2_mkdir_p(VU_CENSUS_DIR);
+    snprintf(path, sizeof path, VU_CENSUS_DIR "/manifest.json");
     mf = fopen(path, "wb");
     if (!mf) { ps2_log("vu1: cannot write %s", path); return; }
     fprintf(mf, "{\n  \"programs\": [\n");
     for (i = 0; i < vu_prog_n; i++) {
         vu_prog *p = &vu_progs[i];
         FILE *bf;
-        snprintf(path, sizeof path, "out/vu_programs/vu1_%016llx.bin",
+        snprintf(path, sizeof path, VU_CENSUS_DIR "/vu1_%016llx.bin",
                  (unsigned long long)p->crc);
         bf = fopen(path, "wb");
         if (bf) { fwrite(p->image, 1, p->image_size, bf); fclose(bf); }
@@ -2214,7 +2531,7 @@ void ps2_vu_census_dump(void) {
     fprintf(mf, "  ],\n  \"dropped\": %llu\n}\n",
             (unsigned long long)vu_prog_dropped);
     fclose(mf);
-    ps2_log("vu1: wrote out/vu_programs/manifest.json (%u images)", vu_prog_n);
+    ps2_log("vu1: wrote " VU_CENSUS_DIR "/manifest.json (%u images)", vu_prog_n);
 }
 
 void ps2_vu_census_report(void) {

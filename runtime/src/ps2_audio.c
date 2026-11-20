@@ -60,6 +60,20 @@ static void SDLCALL audio_cb(void *userdata, SDL_AudioStream *stream,
     s16 buf[AUDIO_CHUNK * AUDIO_CHANNELS];
     (void)userdata;
     (void)total_amount;
+#ifdef PS2_VITA
+    {   /* SDL's audio thread starts as an ordinary runtime thread (priority
+         * 160); the graphics threads outrank that and a heavy field starved
+         * it (stutter, builds 83 and 86). It needs little CPU, so let it
+         * outrank them. AC5_AUDIO_PRIO overrides. */
+        static int done;
+        if (!done) {
+            extern void vita_set_priority(int prio);
+            const char *e = getenv("AC5_AUDIO_PRIO");
+            done = 1;
+            vita_set_priority(e ? atoi(e) : 110);
+        }
+    }
+#endif
     while (additional_amount > 0) {
         int want_bytes = additional_amount;
         int frames, bytes;

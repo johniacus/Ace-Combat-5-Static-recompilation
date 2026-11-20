@@ -129,6 +129,11 @@ void ps2_vk_draw_mesh_topo(const ps2_vk_state *st, const ps2_vk_mesh_block *b,
 extern void (*ps2_vk_before_record)(void);
 
 u32  ps2_vk_texture(u64 key, u32 hash, const u8 *rgba, u32 w, u32 h);
+/* Like ps2_vk_texture, but the pixels are produced later by fill(job, rgba)
+ * on the renderer's side (which frees job with free()). 0xFFFFFFFF: refused,
+ * the caller keeps job. */
+u32  ps2_vk_texture_async(u64 key, u32 hash, u32 w, u32 h,
+                          void (*fill)(void *job, u8 *rgba), void *job);
 int  ps2_vk_texture_is(u32 idx, u64 key, u32 hash);
 
 u32  ps2_vk_texture_native(u32 src, u32 x, u32 y, u32 w, u32 h);
@@ -138,6 +143,8 @@ const u8 *ps2_vk_texture_pixels(u32 idx);
 void ps2_vk_texture_size(u32 idx, u32 *w, u32 *h);
 
 void ps2_vk_invalidate(u32 base, u32 size);
+/* circuit 1 shown over the presented picture: rt < 0 none; alpha < 0 per pixel */
+void ps2_vk_present_overlay(int rt, u32 x, u32 y, float alpha);
 
 #define PS2_VK_PRESENT_BLANK 0xFFFFFFFFu
 int  ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt);

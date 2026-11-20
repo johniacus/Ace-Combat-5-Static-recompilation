@@ -2,6 +2,21 @@
 #include "ps2_hle.h"
 #include "ps2_vfs.h"
 #include <SDL3/SDL.h>
+
+#ifdef PS2_VITA
+/* No SDL spinlocks on the Vita: its scheduler does not time-slice, so the
+ * audio thread spinning on a lock held by a lower-priority thread on the
+ * same core never lets that thread finish -- the game, and anything else
+ * waiting on that thread (the log, file I/O), freezes for good. A mutex
+ * sleeps instead. */
+#include <pthread.h>
+#define SDL_SpinLock pthread_mutex_t
+#define SDL_LockSpinlock(l) pthread_mutex_lock(l)
+#define SDL_UnlockSpinlock(l) pthread_mutex_unlock(l)
+#define PS2_AUDIO_LOCK_INIT = PTHREAD_MUTEX_INITIALIZER
+#else
+#define PS2_AUDIO_LOCK_INIT
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,7 +33,7 @@ typedef struct {
     s16 previous_block[2];
 } nu_stream;
 static nu_stream streams[8];
-static SDL_SpinLock stream_lock;
+static SDL_SpinLock stream_lock PS2_AUDIO_LOCK_INIT;
 
 static u32 disk_offset(const nu_stream *s, u32 byte, u32 ch) {
     return byte / s->interleave * s->interleave * s->channels
@@ -170,12 +185,13 @@ void ps2_nustream_status(u32 slot, u32 *position, u32 *ended) {
 }
 
 void ps2_nustream_report(u32 slot) {
+    nu_stream c;
     SDL_LockSpinlock(&stream_lock);
-    nu_stream *s = &streams[slot];
-    ps2_log("nustream: audio slot=%u ready=%u playing=%u paused=%u voices=%u,%u loop=%08X mixed=%llu audible=%llu",
-            slot, s->ready, s->playing, s->paused, s->voice[0], s->voice[1], (u32)s->loop,
-            (unsigned long long)s->mixed, (unsigned long long)s->audible);
+    c = streams[slot];                 /* copy, then log without the lock */
     SDL_UnlockSpinlock(&stream_lock);
+    ps2_log("nustream: audio slot=%u ready=%u playing=%u paused=%u voices=%u,%u loop=%08X mixed=%llu audible=%llu",
+            slot, c.ready, c.playing, c.paused, c.voice[0], c.voice[1], (u32)c.loop,
+            (unsigned long long)c.mixed, (unsigned long long)c.audible);
 }
 
 u64 ps2_nustream_voice_mask(void) {

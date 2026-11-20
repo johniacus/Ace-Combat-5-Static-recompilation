@@ -180,6 +180,9 @@ void ps2_settings_defaults(ps2_settings *s) {
     s->aspect = PS2_ASPECT_STRETCH;
     s->aspect_custom = 16.0f / 9.0f;
     s->hud_layout = PS2_HUD_CENTERED;
+#ifdef PS2_VITA
+    s->widescreen = 1;      /* the Vita's screen is 16:9 */
+#endif
     s->present_mode = PS2_PRESENT_MAILBOX;
     s->ui_scale = 1.0f;
     s->block_input_in_menu = 1;

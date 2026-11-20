@@ -300,17 +300,93 @@ void rn_vp_init(void) {
             rn_vp_mode == 2 ? "verifying against VU1" : "native");
 }
 
+/* worker timing: native program bodies and their GS packet submission */
+#ifdef PS2_VITA
+#include <psp2/kernel/processmgr.h>
+extern int ac5_prof;
+static inline u64 tq_us(void) { return ac5_prof ? sceKernelGetProcessTimeWide() : 0ull; }
+#else
+#include <time.h>
+static inline u64 tq_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+                                 return (u64)t.tv_sec * 1000000u + (u64)t.tv_nsec / 1000u; }
+#endif
+static u64 tq_prog_us[64], tq_prog_n[64], tq_sub_us, tq_sub_n, tq_decl_n[64];
+static u64 tf_prog_us[64], tf_prog_n[64], tf_ident_us, tf_ident_n, tf_memo_miss;
+/* per-field breakdown for the slow-field log; resets each call */
+int rn_vp_field_breakdown(char *b, int n) {
+    int o = 0;
+    for (u32 i = 0; i < 64 && o < n; i++)
+        if (tf_prog_n[i])
+            o += snprintf(b + o, (size_t)(n - o), " %s %.1f ms/%llu", rn_vp_prog_name((int)i),
+                          tf_prog_us[i] / 1000.0, (unsigned long long)tf_prog_n[i]);
+    if (o < n)
+        o += snprintf(b + o, (size_t)(n - o), " | program identify %.1f ms/%llu (%llu full compares)",
+                      tf_ident_us / 1000.0, (unsigned long long)tf_ident_n, (unsigned long long)tf_memo_miss);
+    memset(tf_prog_us, 0, sizeof tf_prog_us); memset(tf_prog_n, 0, sizeof tf_prog_n);
+    tf_ident_us = tf_ident_n = tf_memo_miss = 0;
+    return o;
+}
+u64 rn_tq_state_us, rn_tq_state_n, rn_tq_draw_us, rn_tq_draw_n;
+void rn_vp_timing_report(u32 fields) {
+    char b[1024];
+    int o = snprintf(b, sizeof b, "worker timing over %u fields (ms/field):", fields);
+    if (!fields) return;
+    for (u32 i = 0; i < 64 && o < (int)sizeof b; i++)
+        if (tq_prog_n[i] || tq_decl_n[i])
+            o += snprintf(b + o, sizeof b - (size_t)o, " %s %.2f (%llu runs%s%llu declined)",
+                          rn_vp_prog_name((int)i), tq_prog_us[i] / 1000.0 / fields,
+                          (unsigned long long)tq_prog_n[i], ", ", (unsigned long long)tq_decl_n[i]);
+    {   extern u64 ps2_vt_vif_us[2], ps2_vt_vif_n[2], ps2_vt_run_us[2], ps2_vt_run_n[2];
+        if (o < (int)sizeof b)
+            o += snprintf(b + o, sizeof b - (size_t)o,
+                          " | VIF0 %.2f (%llu transfers, VU0 programs %.2f in %llu runs) VIF1 %.2f (%llu transfers, VU1 programs %.2f in %llu runs)",
+                          ps2_vt_vif_us[0] / 1000.0 / fields, (unsigned long long)ps2_vt_vif_n[0],
+                          ps2_vt_run_us[0] / 1000.0 / fields, (unsigned long long)ps2_vt_run_n[0],
+                          ps2_vt_vif_us[1] / 1000.0 / fields, (unsigned long long)ps2_vt_vif_n[1],
+                          ps2_vt_run_us[1] / 1000.0 / fields, (unsigned long long)ps2_vt_run_n[1]);
+        memset(ps2_vt_vif_us, 0, sizeof ps2_vt_vif_us); memset(ps2_vt_vif_n, 0, sizeof ps2_vt_vif_n);
+        memset(ps2_vt_run_us, 0, sizeof ps2_vt_run_us); memset(ps2_vt_run_n, 0, sizeof ps2_vt_run_n);
+    }
+    if (o < (int)sizeof b)
+        o += snprintf(b + o, sizeof b - (size_t)o, " | GS packets from them %.2f (%llu) | native GS state %.2f (%llu) | mesh draw record %.2f (%llu)",
+                      tq_sub_us / 1000.0 / fields, (unsigned long long)tq_sub_n,
+                      rn_tq_state_us / 1000.0 / fields, (unsigned long long)rn_tq_state_n,
+                      rn_tq_draw_us / 1000.0 / fields, (unsigned long long)rn_tq_draw_n);
+    ps2_log("%s", b);
+    memset(tq_prog_us, 0, sizeof tq_prog_us); memset(tq_prog_n, 0, sizeof tq_prog_n);
+    memset(tq_decl_n, 0, sizeof tq_decl_n);
+    tq_sub_us = tq_sub_n = rn_tq_state_us = rn_tq_state_n = rn_tq_draw_us = rn_tq_draw_n = 0;
+}
+
 int rn_vp_run(ps2_vu *vu, u32 start) {
     vpx x;
     vp_prog *p;
     u32 kick_at = 0;
     int r;
+    u64 tid0 = tq_us();
+    int was_dirty = rn_vp_dirty;
     if (rn_vp_dirty) {
+        /* Programs switch many times a field; remember which image is
+         * which (by the microcode's running identity) instead of comparing
+         * up to a thousand instruction pairs per program each time. */
+        extern u64 ps2_vu1_micro_id(void);
+        static struct { u64 id; int slot; } memo[32];
+        static u32 memo_n, memo_next;
+        u64 id = ps2_vu1_micro_id();
+        u32 k;
         rn_vp_dirty = 0;
         resident = -1;
+        for (k = 0; k < memo_n; k++)
+            if (memo[k].id == id) { resident = memo[k].slot; goto matched; }
+        tf_memo_miss++;
         for (u32 i = 0; i < N_PROGS; i++)
             if (prog_matches(&progs[i], vu->micro, vu->micro_size)) { resident = (int)i; break; }
+        k = memo_n < 32u ? memo_n++ : (memo_next++ % 32u);
+        memo[k].id = id;
+        memo[k].slot = resident;
+    matched:;
     }
+    if (was_dirty) { tf_ident_us += tq_us() - tid0; tf_ident_n++; }
     if (resident < 0) { unrecognised_runs++; return 0; }
     p = &progs[resident];
     if (!p->fn || p->off) {
@@ -341,7 +417,15 @@ int rn_vp_run(ps2_vu *vu, u32 start) {
     ver.no_kick += ver.pending;
     ver.pending = 0;
     pkt_reset();
-    r = p->fn(&x, start & (vu->micro_size - 8u), &kick_at);
+    {   u64 t0 = tq_us();
+        r = p->fn(&x, start & (vu->micro_size - 8u), &kick_at);
+        if (resident < 64) {
+            u64 d = tq_us() - t0;
+            tf_prog_us[resident] += d; tf_prog_n[resident]++;
+            tq_prog_us[resident] += d;
+            if (r < 0) tq_decl_n[resident]++; else tq_prog_n[resident]++;
+        }
+    }
     if (r < 0) {
         p->declined++;
         if ((start & (vu->micro_size - 8u)) == 0u) p->declined_init++;
@@ -362,7 +446,12 @@ int rn_vp_run(ps2_vu *vu, u32 start) {
     vu->r = x.r;
     vu->q = x.q;
     vu->p = x.p;
-    if (r > 0 && pkt_n && !pkt_over) pkt_submit();
+    if (r > 0 && pkt_n && !pkt_over) {
+        u64 t0 = tq_us();
+        pkt_submit();
+        tq_sub_us += tq_us() - t0;
+        tq_sub_n++;
+    }
     return 1;
 }
 

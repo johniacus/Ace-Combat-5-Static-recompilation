@@ -1217,8 +1217,14 @@ static u64 field_ns(void) {
 }
 
 static void vb_wait_signal(void);
+#ifdef PS2_VITA
+void vita_pin_current(int core);
+#endif
 static void *vblank_timer(void *unused) {
     u64 last_seen = 0;
+#ifdef PS2_VITA
+    vita_pin_current(2);
+#endif
     u64 fns = field_ns();
     u64 deadline = mono_ns() + fns;
     unsigned quiet = 0, next_report = 5;

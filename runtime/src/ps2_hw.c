@@ -1,4 +1,12 @@
 #include "ps2_runtime.h"
+
+#ifdef PS2_VITA
+/* ARM has no rdtsc here: time the phase profiler with the process clock. */
+u64 vita_tsc(void);
+#undef ps2_tsc
+#define ps2_tsc() vita_tsc()
+#endif
+
 #include "ps2_hle.h"
 #include "ps2_capture.h"
 #include "ps2_gfxq.h"

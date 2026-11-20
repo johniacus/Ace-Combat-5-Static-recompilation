@@ -4,6 +4,21 @@
 #include <string.h>
 #include <SDL3/SDL.h>
 
+#ifdef PS2_VITA
+/* No SDL spinlocks on the Vita: its scheduler does not time-slice, so the
+ * audio thread spinning on a lock held by a lower-priority thread on the
+ * same core never lets that thread finish -- the game, and anything else
+ * waiting on that thread (the log, file I/O), freezes for good. A mutex
+ * sleeps instead. */
+#include <pthread.h>
+#define SDL_SpinLock pthread_mutex_t
+#define SDL_LockSpinlock(l) pthread_mutex_lock(l)
+#define SDL_UnlockSpinlock(l) pthread_mutex_unlock(l)
+#define PS2_AUDIO_LOCK_INIT = PTHREAD_MUTEX_INITIALIZER
+#else
+#define PS2_AUDIO_LOCK_INIT
+#endif
+
 #define SPU2_RAM_SIZE   (2u * 1024u * 1024u)
 #define SPU2_VOICES     48u
 #define SPU2_RATE       48000u
@@ -64,7 +79,7 @@ typedef struct {
 } spu2_voice;
 
 static spu2_voice spu2_v[SPU2_VOICES];
-static SDL_SpinLock spu2_lock;
+static SDL_SpinLock spu2_lock PS2_AUDIO_LOCK_INIT;
 void ps2_spu2_command_lock(void) { SDL_LockSpinlock(&spu2_lock); }
 void ps2_spu2_command_unlock(void) { SDL_UnlockSpinlock(&spu2_lock); }
 u8 ps2_spu2_voice_status(u32 i) {
